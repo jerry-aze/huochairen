@@ -1,0 +1,24 @@
+{
+  "model": "deepseek-flash",
+  "base_url": "https://api.deepseek.com",
+
+  "check_every_minutes": 30,
+  "idle_minutes_before_fetch": 3,
+  "max_news_per_push": 3,
+  "bubble_seconds": 40,
+  "quiet_hours": [0, 8],
+  "feishu_daily_limit": 1,
+  "explain_keep_days": 30,
+
+  "interests": "大模型发布和重要更新、重要研究成果、AI 产品上线、AI 行业重大事件。不要融资八卦、营销软文和标题党。",
+
+  "sources": [
+    { "name": "OpenAI", "type": "rss", "url": "https://openai.com/news/rss.xml" },
+    { "name": "Google DeepMind", "type": "rss", "url": "https://deepmind.google/blog/rss.xml" },
+    { "name": "Anthropic", "type": "page", "url": "https://www.anthropic.com/news", "link_pattern": "anthropic\\.com/news/[^/]+$" },
+    { "name": "Meta AI", "type": "page", "url": "https://ai.meta.com/blog/", "link_pattern": "ai\\.meta\\.com/blog/[^/]+/?$" },
+    { "name": "Hacker News", "type": "rss", "url": "https://hnrss.org/frontpage?points=100" },
+    { "name": "机器之心", "type": "rss", "url": "https://wechat2rss.bestblogs.dev/feed/8d97af31b0de9e48da74558af128a4673d78c9a3.xml" },
+    { "name": "量子位", "type": "rss", "url": "https://www.qbitai.com/feed" }
+  ]
+}
