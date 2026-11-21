@@ -286,19 +286,80 @@ def fetch_balance(key, base_url):
     return None
 
 
+# ------------------------------------------------------------------ 偏好学习（带保险）
+PREFS_FILE = DATA_DIR / "prefs.json"
+TOPICS = ["大模型发布", "研究论文", "AI产品与应用", "开源模型与工具", "公司与行业动态",
+          "芯片与算力", "机器人与具身智能", "AI安全与伦理", "政策与监管", "编程与开发者工具", "其他"]
+# 每种行为算多少分：打开原文 +1，深入浅出 +2，推到飞书 +2，不感兴趣 -3
+ACTION_WEIGHT = {"open": 1.0, "explain": 2.0, "feishu": 2.0, "dislike": -3.0}
+
+
+def load_prefs():
+    d = load_json(PREFS_FILE, {})
+    d.setdefault("events", [])
+    d.setdefault("paused", False)
+    return d
+
+
+def record_pref(cfg, item, action):
+    """记一次你对某条新闻的行为（只记主题，不记内容）。"""
+    if not cfg.get("learning", True):
+        return
+    prefs = load_prefs()
+    if prefs.get("paused") or not item.get("topic"):
+        return
+    prefs["events"].append({"t": time.time(), "topic": item["topic"], "action": action})
+    prefs["events"] = prefs["events"][-500:]
+    save_json(PREFS_FILE, prefs)
+
+
+def topic_scores(cfg):
+    """按时间衰减算每个主题的得分：越久以前的行为影响越小（默认 14 天减半）。"""
+    half = float(cfg.get("pref_half_life_days", 14)) * 86400
+    now = time.time()
+    scores = {}
+    for ev in load_prefs()["events"]:
+        w = ACTION_WEIGHT.get(ev.get("action"), 0) * 0.5 ** ((now - ev.get("t", now)) / half)
+        scores[ev["topic"]] = scores.get(ev["topic"], 0) + w
+    return scores
+
+
+def preference_text(cfg):
+    """给 DeepSeek 看的偏好描述；行为太少时返回空（不学习）。"""
+    if not cfg.get("learning", True) or load_prefs().get("paused"):
+        return "", []
+    sc = topic_scores(cfg)
+    if sum(abs(v) for v in sc.values()) < 4:      # 数据太少，先不影响推荐
+        return "", []
+    liked = [t for t, v in sorted(sc.items(), key=lambda x: -x[1]) if v >= 1][:4]
+    disliked = [t for t, v in sorted(sc.items(), key=lambda x: x[1]) if v <= -1][:3]
+    rare = [t for t in TOPICS if t != "其他" and sc.get(t, 0) < 0.5]
+    parts = []
+    if liked:
+        parts.append("用户最近常看：" + "、".join(liked))
+    if disliked:
+        parts.append("用户不太感兴趣：" + "、".join(disliked))
+    return "；".join(parts), rare
+
+
 # ------------------------------------------------------------------ AI 总结
 PROMPT = """你是一个 AI 新闻编辑。下面是刚抓到的新闻条目（编号、来源、标题、简介）。
 
 用户关心的内容：{interests}
 
+{pref_block}
 请你：
-1. 只挑出符合用户兴趣、真正值得看的 AI 相关新闻，最多 {max_n} 条，按重要程度排序。和 AI 无关的、营销软文、标题党都不要。
-2. 同一件事被多个来源报道时只留一条，优先保留官方来源。
-3. 每条写一个中文标题（不超过 30 字）和一句话中文摘要（不超过 70 字，说清楚发生了什么、为什么值得关注）。
-4. 如果没有值得推的，就返回空列表。
+1. 只挑出真正值得看的 AI 相关新闻，最多 {max_n} 条，按重要程度排序。和 AI 无关的、营销软文、标题党都不要。
+2. **重大新闻必须入选，不受用户偏好影响**（例如头部公司发布重要新模型、行业格局级的大事），并标 "major": true。
+3. 其余名额参考用户偏好排序，但偏好只是参考，不能因此漏掉重要的事。
+{explore_rule}
+5. 同一件事被多个来源报道时只留一条，优先保留官方来源。
+6. 每条写一个中文标题（不超过 30 字）、一句话中文摘要（不超过 70 字），从这个列表里选一个主题：{topics}
+7. 每条写一句很短的推荐理由（不超过 20 字），比如"重大新闻""你常看的开源模型方向""圈外推荐：了解一下监管动向"。
+8. 如果没有值得推的，就返回空列表。
 
 只输出 JSON，格式如下：
-{{"picks": [{{"i": 编号, "title": "中文标题", "summary": "一句话摘要"}}]}}
+{{"picks": [{{"i": 编号, "title": "中文标题", "summary": "一句话摘要", "topic": "主题", "major": false, "explore": false, "reason": "推荐理由"}}]}}
 
 新闻条目：
 {items}"""
@@ -312,7 +373,17 @@ def summarize(cfg, cands, key):
     for i, c in enumerate(cands):
         snippet = (" —— " + c["snippet"][:200]) if c["snippet"] else ""
         lines.append("[{}]（{}）{}{}".format(i, c["source"], c["title"], snippet))
-    prompt = PROMPT.format(interests=cfg.get("interests", "AI 领域的重要新闻"),
+    pref, rare = preference_text(cfg)
+    slots = int(cfg.get("explore_slots", 1))
+    if pref and slots > 0 and max_n >= 2:
+        explore_rule = ("4. 防止信息茧房：至少留 {} 个名额给「圈外推荐」——选一条值得看、但属于用户平时很少看的主题"
+                        "（优先从这些里选：{}）的新闻，标 \"explore\": true，理由以「圈外推荐：」开头。"
+                        "如果没有合适的就不用硬凑。").format(slots, "、".join(rare) or "任意其他主题")
+    else:
+        explore_rule = "4. 尽量让入选的新闻覆盖不同主题，不要都是同一类。"
+    pref_block = ("用户偏好（根据他最近的点击自动学到的，仅供参考）：" + pref + "\n") if pref else ""
+    prompt = PROMPT.format(interests=cfg.get("interests", "AI 领域的重要新闻"), pref_block=pref_block,
+                           explore_rule=explore_rule, topics="、".join(TOPICS),
                            max_n=max_n, items="\n".join(lines))
 
     client = OpenAI(api_key=key, base_url=cfg["base_url"], timeout=120)
@@ -335,7 +406,11 @@ def summarize(cfg, cands, key):
             c = cands[int(p["i"])]
         except Exception:
             continue
-        news.append(make_news(c, p.get("title") or c["title"], p.get("summary", "")))
+        n = make_news(c, p.get("title") or c["title"], p.get("summary", ""))
+        topic = p.get("topic") if p.get("topic") in TOPICS else "其他"
+        n.update({"topic": topic, "major": bool(p.get("major")), "explore": bool(p.get("explore")),
+                  "reason": (p.get("reason") or "")[:30]})
+        news.append(n)
     return news
 
 
@@ -718,6 +793,20 @@ TEXT_DARK = "#1f2430"
 TEXT_GRAY = "#6b7280"
 
 
+def reason_line(it):
+    if it.get("explore"):
+        icon = "🔭"
+    elif it.get("major"):
+        icon = "⭐"
+    else:
+        icon = "💡"
+    text = it.get("reason") or ""
+    if not text and not it.get("topic"):
+        return ""
+    tag = "　#" + it["topic"] if it.get("topic") else ""
+    return "{} {}{}".format(icon, text, tag).strip()
+
+
 class Bubble(QWidget):
     def __init__(self, pet):
         super().__init__(None)
@@ -759,6 +848,10 @@ class Bubble(QWidget):
         self.summary.setStyleSheet("color:{};font-size:13px;".format(TEXT_DARK))
         self.meta = QLabel()
         self.meta.setStyleSheet("color:#3949ab;font-size:11px;")
+        # 推荐理由（为什么推这条），让你看得见它在怎么挑
+        self.reason = QLabel()
+        self.reason.setWordWrap(True)
+        self.reason.setStyleSheet("color:#8a6d1f;font-size:11px;")
         # 顶部一行：标题 + 右上角小叉
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
@@ -780,7 +873,7 @@ class Bubble(QWidget):
         self.x_btn.clicked.connect(self.hide)
         top.addWidget(self.x_btn)
         lay.addLayout(top)
-        for w in (self.title, self.summary, self.meta):
+        for w in (self.title, self.summary, self.reason, self.meta):
             lay.addWidget(w)
 
         btns = QHBoxLayout()
@@ -818,6 +911,7 @@ class Bubble(QWidget):
             self.title.show()
             self.summary.hide()
         self.meta.hide()
+        self.reason.hide()
         self.prev_btn.hide()
         self.next_btn.hide()
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -844,6 +938,8 @@ class Bubble(QWidget):
         self.summary.setVisible(bool(it.get("summary")))
         self.meta.setText("{} · {}　双击卡片看原文 →".format(it["source"], it.get("time", "")))
         self.meta.show()
+        self.reason.setText(reason_line(it))
+        self.reason.setVisible(bool(self.reason.text()))
         self.prev_btn.setVisible(n > 1)
         self.next_btn.setVisible(n > 1)
         self.prev_btn.setEnabled(self.idx > 0)
@@ -909,6 +1005,7 @@ class Bubble(QWidget):
 
     def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self.items:
+            record_pref(self.pet.cfg, self.items[self.idx], "open")
             webbrowser.open(self.items[self.idx]["link"])
 
     def contextMenuEvent(self, e):
@@ -916,20 +1013,33 @@ class Bubble(QWidget):
             return
         m = QMenu(self)
         ex = QAction("深入浅出", self)
-        ex.triggered.connect(lambda: self.pet.explain(dict(self.items[self.idx])))
+        ex.triggered.connect(lambda: (record_pref(self.pet.cfg, self.items[self.idx], "explain"),
+                                      self.pet.explain(dict(self.items[self.idx]))))
         m.addAction(ex)
         a = QAction("推送到飞书", self)
         a.triggered.connect(self.push_current_to_feishu)
         m.addAction(a)
         o = QAction("打开原文", self)
-        o.triggered.connect(lambda: webbrowser.open(self.items[self.idx]["link"]))
+        o.triggered.connect(lambda: (record_pref(self.pet.cfg, self.items[self.idx], "open"),
+                                     webbrowser.open(self.items[self.idx]["link"])))
         m.addAction(o)
+        if self.items[self.idx].get("topic"):
+            m.addSeparator()
+            d = QAction("不感兴趣（少推「{}」）".format(self.items[self.idx]["topic"]), self)
+            d.triggered.connect(self.dislike_current)
+            m.addAction(d)
         self.hide_timer.stop()
         m.exec(e.globalPos())
         self.hide_timer.start(15000)
 
+    def dislike_current(self):
+        record_pref(self.pet.cfg, self.items[self.idx], "dislike")
+        self.flash_header("👌 记住了，以后少推这类")
+
     def push_current_to_feishu(self):
         """把当前这条新闻手动推到飞书（不占每天的自动名额）。"""
+        if self.items:
+            record_pref(self.pet.cfg, self.items[self.idx], "feishu")
         if not feishu_conf():
             self.flash_header("⚠️ 还没设置飞书推送（右键小人 → 设置飞书推送）")
             return
@@ -1175,6 +1285,17 @@ class Pet(QWidget):
             m.addAction(a)
         m.addSeparator()
         # 呼吸灯说明（子菜单，鼠标移上去就能看到）
+        pm = m.addMenu("我的偏好")
+        pv = QAction("查看学到的偏好", self)
+        pv.triggered.connect(self.show_prefs)
+        pm.addAction(pv)
+        paused = load_prefs().get("paused")
+        pp = QAction("恢复学习" if paused else "暂停学习", self)
+        pp.triggered.connect(self.toggle_learning)
+        pm.addAction(pp)
+        pc = QAction("清空偏好，重新开始", self)
+        pc.triggered.connect(self.clear_prefs)
+        pm.addAction(pc)
         lights = m.addMenu("呼吸灯")
         for color, text in (("#4cd17a", "绿灯：待命"),
                             ("#ffbe28", "黄灯闪烁：正在抓新闻 / 正在写深入浅出"),
@@ -1186,6 +1307,35 @@ class Pet(QWidget):
         m.addAction(ar)
         m.addAction(a6)
         m.exec(e.globalPos())
+
+    def show_prefs(self):
+        prefs = load_prefs()
+        sc = topic_scores(self.cfg)
+        lines = []
+        if prefs.get("paused") or not self.cfg.get("learning", True):
+            lines.append("⏸ 学习已暂停，推荐只按 config 里的 interests 来")
+        if not sc:
+            lines.append("还没学到什么。双击打开、深入浅出、推到飞书会算「喜欢」，右键「不感兴趣」算「不喜欢」。")
+        else:
+            for t, v in sorted(sc.items(), key=lambda x: -x[1]):
+                bar = "▮" * min(int(abs(v) + 0.5), 8) or "·"
+                lines.append("{} {}　{}".format("👍" if v > 0 else "👎", t, bar))
+            if sum(abs(v) for v in sc.values()) < 4:
+                lines.append("（行为还太少，暂时不影响推荐）")
+        lines.append("保险：重大新闻照推 · 每轮留 {} 个圈外推荐 · 偏好 {} 天减半".format(
+            self.cfg.get("explore_slots", 1), self.cfg.get("pref_half_life_days", 14)))
+        self.bubble.show_message("\n".join(lines), header="🧭 学到的偏好", small=True, ms=20000)
+
+    def toggle_learning(self):
+        prefs = load_prefs()
+        prefs["paused"] = not prefs.get("paused")
+        save_json(PREFS_FILE, prefs)
+        self.bubble.show_message("已暂停学习，推荐只按你写的 interests 来" if prefs["paused"]
+                                 else "已恢复学习", header="🧭 我的偏好")
+
+    def clear_prefs(self):
+        save_json(PREFS_FILE, {"events": [], "paused": load_prefs().get("paused", False)})
+        self.bubble.show_message("偏好已清空，从头开始学", header="🧭 我的偏好")
 
     def explain(self, item):
         if self.explaining:

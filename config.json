@@ -9,6 +9,9 @@
   "quiet_hours": [0, 8],
   "feishu_daily_limit": 1,
   "explain_keep_days": 30,
+  "learning": true,
+  "explore_slots": 1,
+  "pref_half_life_days": 14,
 
   "interests": "大模型发布和重要更新、重要研究成果、AI 产品上线、AI 行业重大事件。不要融资八卦、营销软文和标题党。",
 
