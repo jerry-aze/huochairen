@@ -8,6 +8,8 @@
   "bubble_seconds": 40,
   "quiet_hours": [0, 8],
   "feishu_daily_limit": 1,
+  "feishu_auto_push": "cloud",
+  "cloud_daily_limit": 1,
   "feishu_with_explain": true,
   "feishu_explain_chars": 250,
   "feishu_skip_domains": ["mp.weixin.qq.com", "weixin.qq.com"],

@@ -37,8 +37,8 @@ from PyQt6.QtWidgets import (
 )
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path.home() / ".ai_news_pet"
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path(os.environ.get("AI_NEWS_PET_DATA") or (Path.home() / ".ai_news_pet"))   # 云端推送时会换个位置
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen.json"
 KEY_FILE = DATA_DIR / "api_key.txt"
 HISTORY_FILE = DATA_DIR / "history.json"
@@ -2076,6 +2076,9 @@ class Pet(QWidget):
 
     def flush_feishu(self):
         """自动推送到飞书：每天最多 feishu_daily_limit 条（默认 1 条，推 DeepSeek 排第一的）。"""
+        if self.cfg.get("feishu_auto_push", "desktop") == "cloud":
+            self.feishu_pending = []   # 每日推送交给 GitHub 云端做了，桌面只留手动推送
+            return
         if not self.feishu_pending or self.feishu_busy or not feishu_conf() or self.in_quiet_hours():
             return
         limit = int(self.cfg.get("feishu_daily_limit", 1))
