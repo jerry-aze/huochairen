@@ -30,10 +30,10 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QBrush, QColor, QCursor, QFont, QGuiApplication, QPainter, QPen
+from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QPainter, QPainterPath, QPen, QPolygonF
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QMenu, QPushButton, QTextBrowser, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QMenu, QMessageBox, QPushButton, QScrollArea, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -139,6 +139,22 @@ def only_today(items):
     return [n for n in items if news_date(n) == today_str()]
 
 
+def day_str(days_ago):
+    from datetime import timedelta
+    return (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+
+def only_recent(items, days=3):
+    """只留最近几天（含今天，默认 3 天）的新闻记录。"""
+    keep = {day_str(i) for i in range(days)}
+    return [n for n in items if news_date(n) in keep]
+
+
+def on_day(items, days_ago):
+    d = day_str(days_ago)
+    return [n for n in items if news_date(n) == d]
+
+
 def clean_text(s, limit=400):
     s = BeautifulSoup(s or "", "html.parser").get_text(" ", strip=True)
     s = re.sub(r"\s+", " ", s)
@@ -193,23 +209,317 @@ def fetch_page(src):
     return items
 
 
+SOURCE_STATS = {}   # 每个源上次抓取的结果：url → {"n": 条数, "ok": 成功?, "t": 时间}
+
+
 def fetch_one(src):
     try:
         items = fetch_page(src) if src.get("type") == "page" else fetch_rss(src)
         log("{}：拿到 {} 条".format(src["name"], len(items)))
+        SOURCE_STATS[src["url"]] = {"n": len(items), "ok": True, "t": time.time()}
         return items
     except Exception as ex:
         log("{}：抓取失败（{}）".format(src["name"], ex))
+        SOURCE_STATS[src["url"]] = {"n": 0, "ok": False, "t": time.time(), "err": str(ex)[:120]}
         return []
 
 
 def fetch_all(sources):
-    sources = [s for s in sources if s.get("enabled", True)]
+    sources = [s for s in list(sources) if s.get("enabled", True)]
     out = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         for items in pool.map(fetch_one, sources):
             out.extend(items)
     return out
+
+
+# ------------------------------------------------------------------ 管理信息源
+def _feed_entries(content):
+    try:
+        f = feedparser.parse(content)
+    except Exception:
+        return None
+    if f.entries and any(e.get("link") for e in f.entries):
+        return f
+    return None
+
+
+def _short_name(s, url):
+    s = re.sub(r"\s+", " ", (s or "")).strip()
+    # 去掉常见的尾巴，如「 - Blog」「| 官网」
+    s = re.split(r"\s+[|\-–—·]\s+", s)[0].strip() or s
+    if not s:
+        from urllib.parse import urlparse
+        s = urlparse(url).netloc.replace("www.", "")
+    return s[:20]
+
+
+def _guess_link_pattern(page_url, soup):
+    """没有 RSS 的网站：在列表页里找「像文章」的链接，归纳出一条链接规律。"""
+    from urllib.parse import urlparse
+    base = urlparse(page_url)
+    host = base.netloc
+    groups = {}
+    for a in soup.find_all("a", href=True):
+        link = urljoin(page_url, a["href"]).split("#")[0].split("?")[0]
+        u = urlparse(link)
+        if u.netloc != host:
+            continue
+        path = u.path.rstrip("/")
+        segs = [s for s in path.split("/") if s]
+        if len(segs) < 2:
+            continue
+        text = clean_text(a.get_text(" ", strip=True), 200)
+        if len(text) < 8:
+            continue
+        parent = "/" + "/".join(segs[:-1])
+        g = groups.setdefault(parent, {"links": set(), "chars": 0})
+        if link not in g["links"]:
+            g["links"].add(link)
+            g["chars"] += len(text)
+    best, score = None, 0
+    want = base.path.rstrip("/")
+    for parent, g in groups.items():
+        n = len(g["links"])
+        if n < 3:
+            continue
+        s = n * (g["chars"] / n)            # 链接多、标题长的更像文章列表
+        if want and parent.startswith(want):
+            s *= 1.5                        # 和你给的网址同一栏目，加分
+        if s > score:
+            best, score = parent, s
+    if not best:
+        return None
+    return re.escape(host + best) + r"/[^/]+/?$"
+
+
+def detect_source(url):
+    """
+    你给一个链接，自动判断怎么抓：
+    1) 本身就是 RSS → 直接用
+    2) 网页里写了 RSS 地址 → 用那个
+    3) 试几个常见的 RSS 地址（/feed、/rss.xml …）
+    4) 都没有 → 当普通网页读，自动归纳文章链接规律
+    成功返回 (源设置, 试抓到的条目)，失败抛出带中文原因的异常。
+    """
+    url = url.strip()
+    if not re.match(r"https?://", url):
+        url = "https://" + url
+    try:
+        r = requests.get(url, headers=UA, timeout=20)
+    except Exception as ex:
+        raise RuntimeError("打不开这个链接（{}）".format(ex.__class__.__name__))
+    if r.status_code >= 400:
+        raise RuntimeError("网站返回错误 {}，可能需要登录或拒绝了访问".format(r.status_code))
+    url = r.url  # 跟随跳转后的真实地址
+
+    def as_rss(feed_url, feed):
+        src = {"name": _short_name(feed.feed.get("title"), feed_url), "type": "rss", "url": feed_url}
+        return src, fetch_rss(src)
+
+    # 1) 本身就是 RSS
+    f = _feed_entries(r.content)
+    if f:
+        return as_rss(url, f)
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    title = soup.title.get_text(strip=True) if soup.title else ""
+
+    # 2) 网页里声明的 RSS
+    cands = []
+    for ln in soup.find_all("link", href=True):
+        t = (ln.get("type") or "").lower()
+        if "rss" in t or "atom" in t:
+            cands.append(urljoin(url, ln["href"]))
+    # 3) 常见地址
+    root = re.match(r"https?://[^/]+", url).group(0)
+    here = url.rstrip("/")
+    for p in ("/feed", "/rss", "/rss.xml", "/feed.xml", "/atom.xml", "/index.xml"):
+        cands += [here + p, root + p]
+    tried = set()
+    for c in cands:
+        if c in tried:
+            continue
+        tried.add(c)
+        try:
+            rr = requests.get(c, headers=UA, timeout=10)
+            if rr.status_code < 400:
+                f = _feed_entries(rr.content)
+                if f:
+                    return as_rss(c, f)
+        except Exception:
+            pass
+
+    # 4) 当网页读
+    pat = _guess_link_pattern(url, soup)
+    if pat:
+        src = {"name": _short_name(title, url), "type": "page", "url": url, "link_pattern": pat}
+        items = fetch_page(src)
+        if len(items) >= 3:
+            return src, items
+    raise RuntimeError("在这个页面里找不到文章列表。可能是需要登录，或者内容是网页加载后才显示的。"
+                       "可以试试换成这个网站的「新闻 / 博客」列表页链接。")
+
+
+# ------------------------------------------------------------------ AI 帮忙找信息源
+FIND_TOOLS = [
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "在网上搜索。用来找这个作者/网站/公众号的官网、博客、RSS 地址。",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "搜索关键词，简短具体"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "try_source",
+        "description": "试抓一个链接（网站首页、文章列表页或 RSS 地址都行）。会自动找 RSS 或读网页，"
+                       "返回能不能用、抓到几条、最新几篇标题。只有试抓成功的链接才能作为最终答案。",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "要试的链接"}}, "required": ["url"]}}},
+]
+
+FIND_PROMPT = """你是火柴人的助手，帮用户给 AI 新闻桌宠添加一个「信息源」。
+用户想加的是：{want}
+
+已有的信息源（不要重复添加）：
+{existing}
+
+你的任务：找到一个能稳定抓到这个来源最新文章的链接，最好是 RSS。
+做法：
+1. 先用 web_search 弄清楚这是什么（官网？博客？微信公众号？个人作者？），找到它的官网 / 博客 / 文章列表页 / RSS。
+2. 用 try_source 试抓候选链接。返回「可以用」并且标题确实是这个来源的文章，才算找到。
+3. 小提示：
+   - 微信公众号本身没有 RSS，要找第三方把公众号转成 RSS 的地址（比如 wechat2rss.bestblogs.dev 上的 feed、或别的公众号转 RSS 服务），可以搜「名字 RSS」「名字 wechat2rss」。
+   - 很多作者在多个平台发文（个人博客、知乎专栏、Substack、Medium、少数派等），公众号找不到 RSS 时可以找这些平台。
+   - 某个链接试不通就换下一个，别在一处反复试。
+4. {limit_text}
+
+最后**只输出一个 JSON**，不要别的文字：
+- 找到了：{{"url": "试抓成功的那个链接", "name": "简短好认的中文名（如：数字生命卡兹克）", "note": "一句话说明这是什么、从哪找到的"}}
+- 没找到：{{"url": "", "note": "一两句话说明原因，以及用户可以怎么办（比如自己去哪找个链接贴进来）"}}
+"""
+
+
+def find_source_agent(cfg, want, key, progress=None):
+    """用户只说了名字、没给链接：让 AI 自己上网找能抓的地址。返回 (源设置, 条目, 说明)。"""
+    from openai import OpenAI
+    # 找源不受「每日预算」限制（花费照常记账），但最多 8 步，防止它一直搜下去。
+    say = progress or (lambda t: None)
+    max_calls = int(cfg.get("find_source_max_calls", 8))
+    max_tokens = int(cfg.get("find_source_max_tokens", 0)) or 10 ** 12
+    limit_text = "最多一共调用 {} 次工具。找到能用的就停，确实找不到也要说明原因。".format(max_calls)
+    existing = "\n".join("- {}：{}".format(s["name"], s["url"]) for s in cfg.get("sources", [])) or "（无）"
+    messages = [{"role": "user", "content": FIND_PROMPT.format(want=want, existing=existing, limit_text=limit_text)}]
+    client = OpenAI(api_key=key, base_url=cfg["base_url"], timeout=120)
+    tried = {}                     # url → (源设置, 条目)，只放试抓成功的
+    calls, tokens, cost, resp = 0, 0, 0.0, None
+    for _round in range(max_calls + 2):
+        allow = calls < max_calls and tokens < max_tokens
+        say("想一想…" if allow else "整理结果…")
+        resp = client.chat.completions.create(model=cfg["model"], messages=messages, tools=FIND_TOOLS,
+                                              tool_choice="auto" if allow else "none")
+        u = getattr(resp, "usage", None)
+        try:
+            cost += record_usage(cfg, u)
+        except Exception as ex:
+            log("记录用量失败：{}".format(ex))
+        tokens += (getattr(u, "total_tokens", 0) or 0) if u else 0
+        msg = resp.choices[0].message
+        tcs = getattr(msg, "tool_calls", None) or []
+        if not tcs:
+            break
+        am = {"role": "assistant", "content": msg.content or "",
+              "tool_calls": [{"id": t.id, "type": "function",
+                              "function": {"name": t.function.name, "arguments": t.function.arguments}}
+                             for t in tcs]}
+        rc = getattr(msg, "reasoning_content", None)
+        if rc:
+            am["reasoning_content"] = rc
+        messages.append(am)
+        for t in tcs:
+            try:
+                args = json.loads(t.function.arguments or "{}")
+            except Exception:
+                args = {}
+            if calls >= max_calls or tokens >= max_tokens:
+                result = "已经达到工具调用上限，请直接输出最终 JSON。"
+            else:
+                calls += 1
+                if t.function.name == "web_search":
+                    q = args.get("query", "")
+                    say("第 {}/{} 步 搜索：{}".format(calls, max_calls, q[:24]))
+                    log("找信息源 第 {} 步：搜索 {}".format(calls, q))
+                    try:
+                        res = web_search(q, n=6)
+                        result = "\n".join("{}. {}\n   {}\n   {}".format(i + 1, r["title"], r["url"], r["snippet"][:160])
+                                           for i, r in enumerate(res)) or "没有搜到结果。"
+                    except Exception as ex:
+                        result = "搜索出错：{}".format(ex)
+                elif t.function.name == "try_source":
+                    url = args.get("url", "")
+                    say("第 {}/{} 步 试抓：{}".format(calls, max_calls, url[:30]))
+                    log("找信息源 第 {} 步：试抓 {}".format(calls, url))
+                    try:
+                        src, items = detect_source(url)
+                        tried[url] = (src, items)
+                        result = "可以用：{}（{}），地址 {}，抓到 {} 条。最新标题：\n{}".format(
+                            src["name"], "RSS" if src["type"] == "rss" else "网页", src["url"], len(items),
+                            "\n".join("- " + x["title"][:60] for x in items[:5]))
+                    except Exception as ex:
+                        result = "不能用：{}".format(ex)
+                else:
+                    result = "没有这个工具。"
+            messages.append({"role": "tool", "tool_call_id": t.id, "content": result})
+    log("找信息源「{}」：用了 {} 次工具，约 {} tokens，¥{:.4f}".format(want, calls, tokens, cost))
+
+    text = ((resp.choices[0].message.content if resp else "") or "").strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    try:
+        data = json.loads(m.group(0)) if m else {}
+    except Exception:
+        data = {}
+    url = (data.get("url") or "").strip()
+    note = (data.get("note") or "").strip()
+    if not url:
+        raise RuntimeError(note or "AI 没找到能用的地址。可以自己找一个链接贴进来。")
+    if url in tried:
+        src, items = tried[url]
+    else:
+        # AI 给了个没试过的链接：自己再验一遍，不能只信它
+        src, items = detect_source(url)
+    if data.get("name"):
+        src["name"] = str(data["name"]).strip()[:20]
+    return src, items, note
+
+
+def save_sources(sources):
+    """只改 config.json 里的 sources，其余设置保持原样；每个源占一行，方便手改。"""
+    path = APP_DIR / "config.json"
+    cfg = load_json(path, None)
+    if cfg is None:
+        raise RuntimeError("config.json 读不出来，没敢改")
+    cfg["sources"] = sources
+    text = json.dumps(cfg, ensure_ascii=False, indent=2)
+    # 短列表（如 "quiet_hours": [0, 8]）收成一行
+    text = re.sub(r"\[\n\s*([^\[\]{}]*?)\n\s*\]",
+                  lambda m: "[" + re.sub(r",\n\s*", ", ", m.group(1)) + "]", text)
+    lines = ",\n".join("    " + json.dumps(s, ensure_ascii=False) for s in sources)
+    block = '"sources": [\n' + lines + "\n  ]"
+    text = re.sub(r'"sources": \[.*?\n  \]', lambda _: block, text, flags=re.S) if sources else text
+    json.loads(text)  # 再检查一遍格式
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(text + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def mark_items_seen(items):
+    """新加的源：把它现在列表里的旧文章记为看过，免得一加上就刷出一堆旧闻。今天发布的留着。"""
+    old = [x["id"] for x in items if not (x.get("ts") and is_today_ts(x["ts"]))]
+    if not old:
+        return
+    seen = load_json(SEEN_FILE, None)
+    if seen is None:
+        return  # 还没抓过第一次，第一次运行本来就只看今天的
+    seen.extend(old)
+    save_json(SEEN_FILE, seen[-5000:])
 
 
 # ------------------------------------------------------------------ Token 用量统计
@@ -365,8 +675,18 @@ PROMPT = """你是一个 AI 新闻编辑。下面是刚抓到的新闻条目（�
 {items}"""
 
 
+def check_daily_budget(cfg):
+    """每天的 DeepSeek 总花费上限（默认 1 元），超了就停到明天。"""
+    cap = float(cfg.get("daily_budget_yuan", 1.0))
+    if cap > 0:
+        spent = usage_summary()[0]["cost"]
+        if spent >= cap:
+            raise RuntimeError("今天 DeepSeek 已花 ¥{:.2f}，达到每日上限 ¥{:.2f}，明天再继续".format(spent, cap))
+
+
 def summarize(cfg, cands, key):
     from openai import OpenAI
+    check_daily_budget(cfg)
 
     max_n = int(cfg.get("max_news_per_push", 3))
     lines = []
@@ -435,20 +755,157 @@ def add_feishu_sent(n):
     save_json(FEISHU_COUNT_FILE, data)
 
 
-def send_feishu(news, title=None):
-    """通过飞书群的自定义机器人发一条富文本消息。成功返回 True。"""
-    c = feishu_conf()
-    if not c:
-        return False
-    lines = []
-    for i, n in enumerate(news, 1):
-        label = n["title"] if len(news) == 1 else "{}. {}".format(i, n["title"])
-        lines.append([{"tag": "a", "text": label, "href": n["link"]}])
-        desc = n.get("summary") or ""
-        lines.append([{"tag": "text", "text": "{}（{}）".format(desc, n["source"]) if desc else "（{}）".format(n["source"])}])
-        lines.append([{"tag": "text", "text": " "}])
-    body = {"msg_type": "post", "content": {"post": {"zh_cn": {
-        "title": title or "🤖 AI 新闻速递 · {} 条".format(len(news)), "content": lines}}}}
+# 飞书里打不开的链接：这些网站在飞书内置浏览器里会被拦（比如公众号文章要求「在微信客户端打开」）
+DEFAULT_FEISHU_SKIP = ["mp.weixin.qq.com", "weixin.qq.com"]
+BLOCK_MARKERS = ["请在微信客户端打开", "环境异常", "访问过于频繁", "Just a moment...", "Access denied",
+                 "Attention Required", "verify you are human"]
+
+
+SHORT_FILE = DATA_DIR / "explain_short.json"   # 精简版缓存：{新闻链接: 文字}
+
+SHORT_PROMPT = """你是一个擅长「深入浅出」的讲解者。请把下面这条 AI 新闻浓缩成一段 {n} 字左右的中文讲解，让人读完就懂：
+- 用一个生活化的场景或比喻开头，然后一句话点明这件事的本质，最后说为什么值得关注。
+- 用"你"称呼读者，口语化，不说教。
+- 只写一到两段纯文字：不要标题、不要列表、不要 Markdown 符号。
+- 诚实：具体数字只能来自下面的材料，材料里没有的不要编。
+
+新闻标题：{title}
+来源：{source}
+摘要：{summary}
+
+材料（可能是原文节选，也可能是已经写好的长篇讲解）：
+{material}"""
+
+
+def short_explain(cfg, item, key, progress=None):
+    """深入浅出精简版（默认约 250 字）。有全文讲解就从全文压缩，没有就直接看原文写；写过的存起来不重复花钱。"""
+    cache = load_json(SHORT_FILE, {})
+    if item["link"] in cache:
+        return cache[item["link"]], 0.0
+    from openai import OpenAI
+    check_daily_budget(cfg)
+    say = progress or (lambda t: None)
+    full = explain_cache_path(item)
+    if full.exists():
+        material = full.read_text(encoding="utf-8")[:8000]
+    else:
+        say("读原文")
+        material = fetch_article_text(item["link"], limit=6000) or "（原文没抓到，只能根据标题和摘要讲你能确定的部分）"
+    say("写精简版")
+    n = int(cfg.get("feishu_explain_chars", 250))
+    prompt = SHORT_PROMPT.format(n=n, title=item["title"], source=item.get("source", ""),
+                                 summary=item.get("summary", ""), material=material)
+    client = OpenAI(api_key=key, base_url=cfg["base_url"], timeout=120)
+    resp = client.chat.completions.create(model=cfg["model"], messages=[{"role": "user", "content": prompt}])
+    cost = 0.0
+    try:
+        cost = record_usage(cfg, getattr(resp, "usage", None))
+    except Exception as ex:
+        log("记录用量失败：{}".format(ex))
+    text = (resp.choices[0].message.content or "").strip()
+    text = re.sub(r"[#*`>]+", "", text).strip()
+    if text:
+        cache = load_json(SHORT_FILE, {})
+        cache[item["link"]] = text
+        if len(cache) > 300:                       # 只留最近 300 条
+            cache = dict(list(cache.items())[-300:])
+        save_json(SHORT_FILE, cache)
+    return text, cost
+
+
+def explains_for_feishu(cfg, items, progress=None, full=False):
+    """推飞书前准备深入浅出：默认是精简版；full=True 时是完整讲解。写不出来就不附，新闻照推。"""
+    if not cfg.get("feishu_with_explain", True) and not full:
+        return {}
+    key = get_api_key()
+    if not key:
+        return {}
+    out = {}
+    for n in items:
+        try:
+            if full:
+                text, cost = explain_news(cfg, n, key, progress=progress)
+            else:
+                text, cost = short_explain(cfg, n, key, progress=progress)
+            if text:
+                out[n["link"]] = text
+                log("飞书附带深入浅出{}：{}（约 ¥{:.4f}）".format("全文" if full else "精简版", n.get("title", ""), cost))
+        except Exception as ex:
+            log("飞书附带深入浅出失败（新闻照推）：{}".format(ex))
+    return out
+
+
+def link_ok_for_feishu(cfg, link):
+    """推到飞书前先试着打开一次链接：打不开、要验证、或是飞书里打不开的网站，都不推。"""
+    from urllib.parse import urlparse
+    skip = cfg.get("feishu_skip_domains", DEFAULT_FEISHU_SKIP)
+
+    def blocked(url):
+        host = (urlparse(url).hostname or "").lower()
+        return any(host == d or host.endswith("." + d) for d in skip)
+
+    if not link or blocked(link):
+        return False, "飞书里打不开这个网站"
+    try:
+        r = requests.get(link, headers=UA, timeout=12, allow_redirects=True)
+        if r.status_code >= 400:
+            return False, "链接打不开（{}）".format(r.status_code)
+        if blocked(r.url):
+            return False, "跳转到了飞书里打不开的网站"
+        head = r.text[:20000]
+        for mk in BLOCK_MARKERS:
+            if mk in head:
+                return False, "网页需要验证或要求在别的 App 打开"
+        return True, ""
+    except requests.exceptions.Timeout:
+        return True, ""          # 只是网站慢，飞书里一般能打开，照常推
+    except Exception as ex:
+        return False, "链接打不开（{}）".format(type(ex).__name__)
+
+
+def md_to_post_lines(md, max_chars=6000):
+    """把深入浅出的 Markdown 转成飞书富文本的行：标题加粗、链接可点、去掉 Markdown 符号。"""
+    # 只去掉最末尾那段「来源 · 原文链接 · 生成时间」小字；文章中间的分隔线要保留
+    head, sep, tail = md.rpartition("\n---\n")
+    if sep and tail.strip().startswith("*来源"):
+        md = head
+    md = md.strip()
+    if len(md) > max_chars:
+        md = md[:max_chars].rsplit("\n", 1)[0] + "\n……（篇幅太长，后面省略了）"
+    out, blank = [], False
+    for raw in md.splitlines():
+        line = raw.strip()
+        if not line:
+            if not blank and out:
+                out.append([{"tag": "text", "text": " "}])
+            blank = True
+            continue
+        blank = False
+        if re.fullmatch(r"[-*_]{3,}", line):       # 文章里的分隔线
+            out.append([{"tag": "text", "text": "────────"}])
+            continue
+        bold = line.startswith("#")
+        line = re.sub(r"^#+\s*", "", line)
+        line = re.sub(r"^[-*]\s+", "• ", line)
+        line = line.replace("**", "").replace("__", "")
+        segs, pos = [], 0
+        for m in re.finditer(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", line):
+            if m.start() > pos:
+                segs.append({"tag": "text", "text": line[pos:m.start()]})
+            segs.append({"tag": "a", "text": m.group(1), "href": m.group(2)})
+            pos = m.end()
+        if pos < len(line):
+            segs.append({"tag": "text", "text": line[pos:]})
+        if bold:                     # 飞书群机器人不支持加粗参数，标题用【】标出来
+            segs = [{"tag": "text", "text": "【"}] + segs + [{"tag": "text", "text": "】"}]
+        segs = [sg for sg in segs if sg.get("text")]
+        out.append(segs or [{"tag": "text", "text": " "}])
+    return out
+
+
+def _feishu_post(c, title, lines):
+    """发一条飞书富文本消息，成功返回 True。"""
+    body = {"msg_type": "post", "content": {"post": {"zh_cn": {"title": title, "content": lines}}}}
     secret = (c.get("secret") or "").strip()
     if secret:
         ts = str(int(time.time()))
@@ -459,11 +916,82 @@ def send_feishu(news, title=None):
         r = requests.post(c["webhook"].strip(), json=body, timeout=15)
         data = r.json()
         ok = data.get("code", data.get("StatusCode", -1)) == 0
-        log("飞书推送{}：{}".format("成功" if ok else "失败", "" if ok else data))
+        log("飞书推送{}：{}".format("成功" if ok else "失败", title if ok else data))
         return ok
     except Exception as ex:
         log("飞书推送失败：{}".format(ex))
         return False
+
+
+def split_lines(lines, max_bytes=9000):
+    """把很多行按大小切成几段，尽量在空行（段落之间）断开。"""
+    chunks, cur, size = [], [], 0
+    for ln in lines:
+        b = len(json.dumps(ln, ensure_ascii=False).encode("utf-8"))
+        is_gap = all(sg.get("text", "").strip() == "" for sg in ln)
+        if cur and size + b > max_bytes:
+            chunks.append(cur)
+            cur, size = [], 0
+            if is_gap:
+                continue
+        cur.append(ln)
+        size += b
+    if cur:
+        chunks.append(cur)
+    # 去掉每段开头结尾的空行
+    clean = []
+    for ch in chunks:
+        while ch and all(sg.get("text", "").strip() == "" for sg in ch[0]):
+            ch = ch[1:]
+        while ch and all(sg.get("text", "").strip() == "" for sg in ch[-1]):
+            ch = ch[:-1]
+        if ch:
+            clean.append(ch)
+    return clean
+
+
+def send_feishu(news, title=None, explains=None):
+    """推到飞书（默认）：一条消息里放新闻标题、摘要，以及深入浅出精简版。成功返回 True。"""
+    c = feishu_conf()
+    if not c:
+        return False
+    explains = explains or {}
+    lines = []
+    for i, n in enumerate(news, 1):
+        label = n["title"] if len(news) == 1 else "{}. {}".format(i, n["title"])
+        lines.append([{"tag": "a", "text": label, "href": n["link"]}])
+        desc = n.get("summary") or ""
+        lines.append([{"tag": "text", "text": "{}（{}）".format(desc, n["source"]) if desc else "（{}）".format(n["source"])}])
+        ex = explains.get(n["link"])
+        if ex:
+            lines.append([{"tag": "text", "text": " "}])
+            lines.append([{"tag": "text", "text": "📖 深入浅出 · 精简版"}])
+            for para in [p.strip() for p in ex.split("\n") if p.strip()]:
+                lines.append([{"tag": "text", "text": para}])
+            lines.append([{"tag": "text", "text": "👉 想看完整讲解：在火柴人的新闻卡片上右键 →「推送全文到飞书」"}])
+        lines.append([{"tag": "text", "text": " "}])
+    return _feishu_post(c, title or "🤖 AI 新闻速递 · {} 条".format(len(news)), lines)
+
+
+def send_feishu_full(item, explain_md):
+    """把一条新闻的深入浅出全文推到飞书，按段落分成几条发。全部发出去返回 True。"""
+    c = feishu_conf()
+    if not c or not explain_md:
+        return False
+    head = [[{"tag": "text", "text": "原文："}, {"tag": "a", "text": item["title"], "href": item["link"]}],
+            [{"tag": "text", "text": " "}]]
+    chunks = split_lines(head + md_to_post_lines(explain_md, 20000))
+    total = len(chunks)
+    for k, ch in enumerate(chunks, 1):
+        if k > 1:
+            time.sleep(0.4)                       # 飞书群机器人有频率限制，慢一点发
+        t = "📖 深入浅出全文：{}".format(item["title"][:24])
+        if total > 1:
+            t += "（{}/{}）".format(k, total)
+        if not _feishu_post(c, t, ch):
+            log("深入浅出全文第 {}/{} 段没发出去".format(k, total))
+            return False
+    return True
 
 
 # ------------------------------------------------------------------ 深入浅出
@@ -476,9 +1004,17 @@ def load_explain_method():
 
 
 def fetch_article_text(url, limit=8000):
-    """抓原文正文（尽力而为，失败就返回空）。"""
+    """抓原文正文（尽力而为：慢网站多等一会儿，失败重试一次；还不行就返回空）。"""
     try:
-        r = requests.get(url, headers=UA, timeout=20)
+        r = None
+        for attempt in range(2):
+            try:
+                r = requests.get(url, headers=UA, timeout=30)
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                if attempt == 1:
+                    raise
+                time.sleep(2)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form", "noscript"]):
@@ -625,31 +1161,147 @@ def migrate_old_explains():
         log("搬旧讲解失败：{}".format(ex))
 
 
-def explain_news(cfg, item, key):
-    """返回 (文章 markdown, 这次花费)。讲过的直接读缓存，不重复花钱。"""
+def web_search(query, n=5):
+    """用 DuckDuckGo 搜索（不需要 Key），返回前几条结果。"""
+    from urllib.parse import parse_qs, unquote, urlparse
+    r = requests.post("https://html.duckduckgo.com/html/", data={"q": query}, headers=UA, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    out = []
+    for res in soup.select(".result"):
+        a = res.select_one(".result__a")
+        if not a or not a.get("href"):
+            continue
+        href = a["href"]
+        if "uddg=" in href:   # DuckDuckGo 的跳转链接，取出真实地址
+            href = unquote(parse_qs(urlparse(href).query).get("uddg", [href])[0])
+        sn = res.select_one(".result__snippet")
+        out.append({"title": a.get_text(" ", strip=True), "url": href,
+                    "snippet": sn.get_text(" ", strip=True) if sn else ""})
+        if len(out) >= n:
+            break
+    return out
+
+
+EXPLAIN_TOOLS = [
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "在网上搜索背景资料。只在原文信息不够、或有需要查证的概念/数据时使用。",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "搜索关键词，简短具体"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "open_url",
+        "description": "打开一个网页，读取正文（最多约 4000 字）。用来细读搜索结果里最相关的一两条。",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "网页地址"}}, "required": ["url"]}}},
+]
+
+AGENT_RULES = """
+
+# 查资料（你可以自己决定要不要用）
+你有两个工具：web_search（搜索）和 open_url（打开网页读正文）。
+- 原文已经够讲清楚，就**不要查**，直接写。
+- 只有原文信息不足、有不懂的概念、或需要查证某个数字时才查。
+- **原文没抓到时，一定要查**：搜同一件事的其他报道（别家媒体、官方博客、论文、发布方公告），不要只盯着原文链接。某个网页打不开就换下一个，别在一处耗光次数。
+- 搜索结果的摘要本身也是信息，可以先看摘要判断哪个最值得打开。
+- 最多一共调用 {max_calls} 次工具，用完就必须直接写文章。先想清楚最想查什么再查。
+- 查到的外部信息也要遵守诚实要求：只用你在搜索结果/网页里真实看到的内容。
+- 如果用了查到的资料，在文章最后加一节「参考资料」，列出用到的网页标题和链接。"""
+
+
+def run_tool(name, args, used_urls, left=0):
+    try:
+        if name == "web_search":
+            res = web_search(args.get("query", ""))
+            if not res:
+                return "没有搜到结果。"
+            return "\n".join("{}. {}\n   {}\n   {}".format(i + 1, r["title"], r["url"], r["snippet"][:200])
+                             for i, r in enumerate(res))
+        if name == "open_url":
+            url = args.get("url", "")
+            text = fetch_article_text(url, limit=4000)
+            if text:
+                used_urls.append(url)
+            if text:
+                return text
+            return ("这个网页打不开（可能太慢或拒绝访问）。不要再打开它了。你还剩 {} 次工具调用："
+                    "换个关键词搜索，或者打开搜索结果里其他媒体、官方网站对同一件事的报道。").format(left)
+        return "没有这个工具。"
+    except Exception as ex:
+        return "工具出错：{}".format(ex)
+
+
+def explain_news(cfg, item, key, progress=None):
+    """返回 (文章 markdown, 这次花费)。讲过的直接读缓存，不重复花钱。
+    会自己决定要不要上网查资料，但有三道闸：每篇最多查几次、每篇 token 上限、每天花费上限。"""
     path = explain_cache_path(item)
     if path.exists():
         return path.read_text(encoding="utf-8"), 0.0
     from openai import OpenAI
+    check_daily_budget(cfg)
+    say = progress or (lambda t: None)
+    say("读原文")
     article = fetch_article_text(item["link"])
     user = ("请把这条新闻给我讲清楚。\n\n标题：{}\n来源：{}\n摘要：{}\n链接：{}\n\n原文节选（可能不完整）：\n{}"
             .format(item["title"], item["source"], item.get("summary", ""), item["link"],
-                    article or "（没能抓到原文，请只基于标题和摘要讲你能确定的部分）"))
+                    article or "（没能抓到原文，请只基于标题和摘要讲你能确定的部分，必要时可以查资料）"))
+    use_agent = cfg.get("explain_agent", True)
+    max_calls = int(cfg.get("explain_max_tool_calls", 5))
+    max_tokens = int(cfg.get("explain_max_tokens", 60000))
+    system = load_explain_method() + (AGENT_RULES.format(max_calls=max_calls) if use_agent else "")
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     client = OpenAI(api_key=key, base_url=cfg["base_url"], timeout=300)
-    resp = client.chat.completions.create(
-        model=cfg["model"],
-        messages=[{"role": "system", "content": load_explain_method()},
-                  {"role": "user", "content": user}],
-    )
-    cost = 0.0
-    try:
-        cost = record_usage(cfg, getattr(resp, "usage", None))
-    except Exception as ex:
-        log("记录用量失败：{}".format(ex))
-    text = (resp.choices[0].message.content or "").strip()
+
+    cost, tokens, calls, used_urls = 0.0, 0, 0, []
+    resp = None
+    for _round in range(max_calls + 2):            # 轮数也有上限，防止死循环
+        allow_tools = use_agent and calls < max_calls and tokens < max_tokens
+        kwargs = {"model": cfg["model"], "messages": messages}
+        if use_agent:
+            kwargs["tools"] = EXPLAIN_TOOLS
+            kwargs["tool_choice"] = "auto" if allow_tools else "none"
+        say("写讲解" if not allow_tools else "思考")
+        resp = client.chat.completions.create(**kwargs)
+        u = getattr(resp, "usage", None)
+        try:
+            cost += record_usage(cfg, u)
+        except Exception as ex:
+            log("记录用量失败：{}".format(ex))
+        tokens += (getattr(u, "total_tokens", 0) or 0) if u else 0
+        msg = resp.choices[0].message
+        tcs = getattr(msg, "tool_calls", None) or []
+        if not tcs:
+            break
+        # AI 想用工具：记下它的请求，执行（超额的直接拒绝）
+        am = {"role": "assistant", "content": msg.content or "",
+              "tool_calls": [{"id": t.id, "type": "function",
+                              "function": {"name": t.function.name, "arguments": t.function.arguments}}
+                             for t in tcs]}
+        rc = getattr(msg, "reasoning_content", None)
+        if rc:
+            am["reasoning_content"] = rc
+        messages.append(am)
+        for t in tcs:
+            try:
+                args = json.loads(t.function.arguments or "{}")
+            except Exception:
+                args = {}
+            if calls >= max_calls or tokens >= max_tokens:
+                result = "已经达到查资料的上限，不能再查了，请直接用现有信息写文章。"
+            else:
+                calls += 1
+                what = args.get("query") or args.get("url", "")
+                say("{} {}/{}：{}".format("搜索" if t.function.name == "web_search" else "读网页",
+                                         calls, max_calls, what[:30]))
+                log("深入浅出查资料 {}/{}：{} {}".format(calls, max_calls, t.function.name, what))
+                result = run_tool(t.function.name, args, used_urls, left=max_calls - calls)
+            messages.append({"role": "tool", "tool_call_id": t.id, "content": result})
+    log("深入浅出：查资料 {} 次，约 {} tokens，¥{:.4f}".format(calls, tokens, cost))
+    text = ((resp.choices[0].message.content if resp else "") or "").strip()
     if text:
-        text += "\n\n---\n\n*来源：{} · [原文链接]({}) · 讲解生成于 {}*\n".format(
-            item["source"], item["link"], datetime.now().strftime("%Y-%m-%d %H:%M"))
+        text += "\n\n---\n\n*来源：{} · [原文链接]({}) · 讲解生成于 {}{}*\n".format(
+            item["source"], item["link"], datetime.now().strftime("%Y-%m-%d %H:%M"),
+            " · 查了 {} 次资料".format(calls) if calls else " · 没有额外查资料")
         EXPLAIN_DIR.mkdir(exist_ok=True)
         path.write_text(text, encoding="utf-8")
         remember_explain(item, path)
@@ -658,6 +1310,7 @@ def explain_news(cfg, item, key):
 
 class Explainer(QObject):
     done = pyqtSignal(object, str, str)   # item, 文章, 错误信息
+    progress = pyqtSignal(str)
 
     def __init__(self, cfg):
         super().__init__()
@@ -671,7 +1324,7 @@ class Explainer(QObject):
             key = get_api_key()
             if not key:
                 raise RuntimeError("还没设置 DeepSeek API Key")
-            text, cost = explain_news(self.cfg, item, key)
+            text, cost = explain_news(self.cfg, item, key, progress=self.progress.emit)
             if not text:
                 raise RuntimeError("DeepSeek 没有返回内容")
             log("深入浅出完成：{}（约 ¥{:.4f}）".format(item["title"], cost))
@@ -723,6 +1376,13 @@ class ReaderWindow(QWidget):
 
         scr = QGuiApplication.primaryScreen().availableGeometry()
         self.move(scr.center().x() - self.width() // 2, scr.top() + 60)
+
+
+class StatusBus(QObject):
+    """后台线程通知小人改状态用（Qt 界面只能在主线程改）。"""
+    busy = pyqtSignal(str)          # 开始忙：小人去黑板写、亮黄灯
+    step = pyqtSignal(str)          # 进度（鼠标停在小人上能看到）
+    done = pyqtSignal(bool, str)    # 结束：成功亮蓝灯 / 失败亮紫灯
 
 
 class Worker(QObject):
@@ -805,6 +1465,235 @@ def reason_line(it):
         return ""
     tag = "　#" + it["topic"] if it.get("topic") else ""
     return "{} {}{}".format(icon, text, tag).strip()
+
+
+class SourcesWindow(QWidget):
+    """右键「管理信息源」：开关、删除、粘贴链接添加。改完马上生效，不用重启。"""
+    added = pyqtSignal(object, object, str)   # 源设置, 试抓到的条目, 错误信息（或 AI 的说明）
+    progress = pyqtSignal(str)
+
+    def __init__(self, pet):
+        super().__init__(None, Qt.WindowType.Window)
+        self.pet = pet
+        self.busy = False
+        self.setWindowTitle("火柴人 · 信息源")
+        self.resize(560, 600)
+        self.setStyleSheet(
+            "QWidget{background:#fbfaf7;color:#1f2430;font-size:13px;}"
+            "QLineEdit{background:#fff;border:1px solid #dcd8cf;border-radius:8px;padding:8px 10px;}"
+            "QLineEdit:focus{border-color:#7c8cf8;}"
+            "QPushButton{background:#fff;border:1px solid #dcd8cf;border-radius:8px;padding:7px 14px;}"
+            "QPushButton:hover{background:#f3f1ec;}"
+            "QPushButton#add{background:#3949ab;color:#fff;border:none;}"
+            "QPushButton#add:hover{background:#2f3d93;}"
+            "QPushButton#add:disabled{background:#9aa3d6;}"
+            "QPushButton#del{border:none;color:#9ca3af;padding:4px 8px;background:transparent;}"
+            "QPushButton#del:hover{color:#e5484d;}"
+            "QScrollArea{border:none;}"
+            "QCheckBox::indicator{width:16px;height:16px;border:1.5px solid #c9c4b8;border-radius:4px;background:#fff;}"
+            "QCheckBox::indicator:checked{background:#3949ab;border-color:#3949ab;}")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 18, 22, 18)
+        lay.setSpacing(10)
+
+        tip = QLabel("粘贴网站或 RSS 链接；没有链接就直接写名字（比如「数字生命卡兹克」），AI 会自己上网去找。"
+                     "都会先试抓一次，确认能用才加上。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#6b7280;font-size:12px;")
+        lay.addWidget(tip)
+        row = QHBoxLayout()
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("链接，或者直接说名字：如 数字生命卡兹克")
+        self.input.returnPressed.connect(self.add)
+        row.addWidget(self.input, 1)
+        self.add_btn = QPushButton("添加")
+        self.add_btn.setObjectName("add")
+        self.add_btn.clicked.connect(self.add)
+        row.addWidget(self.add_btn)
+        lay.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("font-size:12px;color:#6b7280;")
+        self.status.hide()
+        lay.addWidget(self.status)
+
+        self.count_lbl = QLabel("")
+        self.count_lbl.setStyleSheet("color:#6b7280;font-size:12px;margin-top:6px;")
+        lay.addWidget(self.count_lbl)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        lay.addWidget(self.scroll, 1)
+        foot = QLabel("取消勾选 = 暂停这个源（设置留着，随时再开）。改动立刻保存到 config.json，下一轮抓新闻就生效。")
+        foot.setWordWrap(True)
+        foot.setStyleSheet("color:#9ca3af;font-size:11px;")
+        lay.addWidget(foot)
+
+        self.added.connect(self.on_added)
+        self.find_cost = 0.0
+        self.progress.connect(lambda t: self.say("🔎 AI 正在找「{}」：{}　（这次已花 ¥{:.3f}）".format(
+            self.want, t, usage_summary()[0]["cost"] - self.find_cost)))
+        self.refresh()
+        scr = QGuiApplication.primaryScreen().availableGeometry()
+        self.move(scr.center().x() - self.width() // 2, scr.top() + 80)
+
+    @property
+    def sources(self):
+        return self.pet.cfg.setdefault("sources", [])
+
+    def refresh(self):
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 12, 0)
+        v.setSpacing(6)
+        on = sum(1 for s in self.sources if s.get("enabled", True))
+        self.count_lbl.setText("现在的信息源：{} 个，开着 {} 个".format(len(self.sources), on))
+        for i, s in enumerate(self.sources):
+            card = QFrame()
+            card.setObjectName("card")
+            card.setStyleSheet("#card{background:#fff;border:1px solid #ebe8e1;border-radius:10px;}"
+                               "QLabel,QCheckBox{background:transparent;}")
+            h = QHBoxLayout(card)
+            h.setContentsMargins(12, 8, 6, 8)
+            cb = QCheckBox()
+            cb.setChecked(s.get("enabled", True))
+            cb.toggled.connect(lambda val, idx=i: self.toggle(idx, val))
+            h.addWidget(cb)
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            kind = "RSS" if s.get("type", "rss") == "rss" else "网页"
+            name = QLabel("<b>{}</b>　<span style='color:#9ca3af;font-size:11px;'>{}</span>".format(s["name"], kind))
+            col.addWidget(name)
+            st = SOURCE_STATS.get(s["url"])
+            if not s.get("enabled", True):
+                info, color = "已暂停", "#9ca3af"
+            elif st is None:
+                info, color = "还没抓过", "#9ca3af"
+            elif st["ok"]:
+                info, color = "上次拿到 {} 条".format(st["n"]), ("#3f9b5c" if st["n"] else "#b7791f")
+            else:
+                info, color = "上次抓取失败", "#e5484d"
+            u = s["url"] if len(s["url"]) <= 52 else s["url"][:50] + "…"
+            sub = QLabel("<span style='color:{};'>{}</span>　<span style='color:#9ca3af;'>{}</span>".format(color, info, u))
+            sub.setStyleSheet("font-size:11px;")
+            sub.setToolTip(s["url"] + ("\n" + st.get("err", "") if st and not st["ok"] else ""))
+            col.addWidget(sub)
+            h.addLayout(col, 1)
+            d = QPushButton("删除")
+            d.setObjectName("del")
+            d.clicked.connect(lambda _=False, idx=i: self.delete(idx))
+            h.addWidget(d)
+            v.addWidget(card)
+        v.addStretch(1)
+        self.scroll.setWidget(box)
+
+    def save(self):
+        try:
+            save_sources(self.sources)
+            return True
+        except Exception as ex:
+            self.say("保存失败：{}".format(ex), "#e5484d")
+            return False
+
+    def say(self, text, color="#6b7280"):
+        self.status.setText(text)
+        self.status.setStyleSheet("font-size:12px;color:{};".format(color))
+        self.status.show()
+
+    def toggle(self, idx, val):
+        s = self.sources[idx]
+        if val:
+            s.pop("enabled", None)
+        else:
+            s["enabled"] = False
+        if self.save():
+            self.say("{}「{}」".format("已打开" if val else "已暂停", s["name"]))
+            log("信息源：{} {}".format("打开" if val else "暂停", s["name"]))
+        self.refresh()
+
+    def delete(self, idx):
+        s = self.sources[idx]
+        ans = QMessageBox.question(self, "删除信息源", "确定删除「{}」吗？\n{}".format(s["name"], s["url"]))
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self.sources.pop(idx)
+        if self.save():
+            self.say("已删除「{}」".format(s["name"]))
+            log("信息源：删除 {} {}".format(s["name"], s["url"]))
+        self.refresh()
+
+    def add(self):
+        url = self.input.text().strip()
+        if not url or self.busy:
+            return
+        norm = lambda x: re.sub(r"^https?://(www\.)?", "", x).rstrip("/").lower()
+        for s in self.sources:
+            if norm(s["url"]) == norm(url):
+                self.say("「{}」已经在列表里了".format(s["name"]), "#b7791f")
+                return
+        is_link = bool(re.match(r"^(https?://)?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+(:\d+)?(/\S*)?$", url))
+        if not is_link:
+            key = get_api_key()
+            if not key:
+                self.say("让 AI 找源需要 DeepSeek API Key，先右键「设置 DeepSeek API Key」，或者直接贴链接。", "#b7791f")
+                return
+        self.busy = True
+        self.want = url
+        self.add_btn.setEnabled(False)
+        self.input.setEnabled(False)
+        if is_link:
+            self.add_btn.setText("检查中…")
+            self.say("正在看这个网站怎么抓（找 RSS → 试常见地址 → 读网页），大概 5–30 秒…")
+        else:
+            self.add_btn.setText("AI 找源中…")
+            self.find_cost = usage_summary()[0]["cost"]
+            self.say("🔎 AI 正在上网找「{}」，可能要一两分钟…".format(url))
+        cfg = self.pet.cfg
+
+        def run():
+            try:
+                if is_link:
+                    src, items = detect_source(url)
+                    note = ""
+                else:
+                    src, items, note = find_source_agent(cfg, url, key, progress=self.progress.emit)
+                src["_note"] = note
+                self.added.emit(src, items, "")
+            except Exception as ex:
+                self.added.emit(None, None, str(ex))
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_added(self, src, items, err):
+        self.busy = False
+        self.add_btn.setEnabled(True)
+        self.input.setEnabled(True)
+        self.add_btn.setText("添加")
+        note = src.pop("_note", "") if src else ""
+        if err:
+            self.say("没加上：" + err, "#e5484d")
+            return
+        norm = lambda x: re.sub(r"^https?://(www\.)?", "", x).rstrip("/").lower()
+        for s in self.sources:
+            if norm(s["url"]) == norm(src["url"]):
+                self.say("这个网站的 RSS「{}」已经在列表里了".format(s["name"]), "#b7791f")
+                return
+        names = {s["name"] for s in self.sources}
+        base, k = src["name"], 2
+        while src["name"] in names:
+            src["name"] = "{}{}".format(base, k)
+            k += 1
+        self.sources.append(src)
+        if not self.save():
+            self.sources.pop()
+            return
+        SOURCE_STATS[src["url"]] = {"n": len(items), "ok": True, "t": time.time()}
+        mark_items_seen(items)
+        log("信息源：添加 {}（{}）{}".format(src["name"], src["type"], src["url"]))
+        sample = "、".join("《{}》".format(x["title"][:24]) for x in items[:2])
+        self.say("✅ 加好了：{}（{}），试抓到 {} 条，比如 {}。下一轮抓新闻就会用上。{}".format(
+            src["name"], "RSS" if src["type"] == "rss" else "网页", len(items), sample,
+            ("\nAI 说明：" + note) if note else ""), "#3f9b5c")
+        self.input.clear()
+        self.refresh()
 
 
 class Bubble(QWidget):
@@ -1019,6 +1908,9 @@ class Bubble(QWidget):
         a = QAction("推送到飞书", self)
         a.triggered.connect(self.push_current_to_feishu)
         m.addAction(a)
+        af = QAction("推送全文到飞书（深入浅出完整版）", self)
+        af.triggered.connect(lambda: self.push_current_to_feishu(full=True))
+        m.addAction(af)
         o = QAction("打开原文", self)
         o.triggered.connect(lambda: (record_pref(self.pet.cfg, self.items[self.idx], "open"),
                                      webbrowser.open(self.items[self.idx]["link"])))
@@ -1036,8 +1928,8 @@ class Bubble(QWidget):
         record_pref(self.pet.cfg, self.items[self.idx], "dislike")
         self.flash_header("👌 记住了，以后少推这类")
 
-    def push_current_to_feishu(self):
-        """把当前这条新闻手动推到飞书（不占每天的自动名额）。"""
+    def push_current_to_feishu(self, full=False):
+        """把当前这条新闻手动推到飞书（不占每天的自动名额）。full=True：推深入浅出全文。"""
         if self.items:
             record_pref(self.pet.cfg, self.items[self.idx], "feishu")
         if not feishu_conf():
@@ -1047,16 +1939,54 @@ class Bubble(QWidget):
         self.flash_header("⏳ 正在推送到飞书…", keep=True)
         self.push_result = None
 
+        self.push_why = ""
+        self.push_step = "check"
+
+        bus = self.pet.bus
+
         def run():
-            self.push_result = send_feishu([item], title="📌 AI 新闻推荐")
+            bus.busy.emit("推送到飞书：" + item.get("title", ""))
+            bus.step.emit("检查链接")
+            ok, why = link_ok_for_feishu(self.pet.cfg, item.get("link", ""))
+            if not ok:
+                self.push_why = why
+                log("飞书跳过：{}（{}）".format(item.get("title", ""), why))
+                self.push_result = False
+                bus.done.emit(False, "没推到飞书：" + why)
+                return
+            self.push_step = "write"
+            bus.step.emit("写深入浅出全文" if full else "写深入浅出精简版")
+            explains = explains_for_feishu(self.pet.cfg, [item], progress=bus.step.emit, full=full)
+            self.push_step = "send"
+            bus.step.emit("发送到飞书")
+            if full:
+                ex = explains.get(item["link"])
+                if not ex:
+                    self.push_why = "全文没写出来（看看运行日志）"
+                    self.push_result = False
+                    bus.done.emit(False, "深入浅出全文没写出来")
+                    return
+                self.push_result = send_feishu_full(item, ex)
+            else:
+                self.push_result = send_feishu([item], title="📌 AI 新闻推荐", explains=explains)
+            bus.done.emit(self.push_result, "已推送到飞书：{}".format(item.get("title", "")) if self.push_result
+                          else "推送飞书失败，看看运行日志")
         threading.Thread(target=run, daemon=True).start()
 
         def check(tries=[0]):
-            if self.push_result is None and tries[0] < 40:
+            if self.push_result is None and tries[0] < 2400:      # 最多等 10 分钟（要先写深入浅出）
                 tries[0] += 1
+                if tries[0] % 8 == 0 and self.push_step == "write":
+                    self.flash_header("📖 先写深入浅出全文，再推到飞书（约 1 分钟）…" if full
+                                      else "📖 先写精简版讲解，再推到飞书…", keep=True)
                 QTimer.singleShot(250, check)
                 return
-            self.flash_header("✅ 已推送到飞书" if self.push_result else "❌ 推送失败，看看运行日志")
+            if self.push_result:
+                self.flash_header("✅ 全文已推送到飞书" if full else "✅ 已推送到飞书")
+            elif self.push_why:
+                self.flash_header("🚫 没推：" + self.push_why)
+            else:
+                self.flash_header("❌ 推送失败，看看运行日志")
         QTimer.singleShot(250, check)
 
     def flash_header(self, text, keep=False):
@@ -1098,7 +2028,7 @@ class Pet(QWidget):
         self.last_msg = ""
         self.feishu_pending = []
         self.feishu_busy = False
-        self.history = only_today(load_json(HISTORY_FILE, []))
+        self.history = only_recent(load_json(HISTORY_FILE, []), self.history_days())
         self.press_pos = None
         self.moved = False
 
@@ -1109,6 +2039,12 @@ class Pet(QWidget):
         self.readers = []
         self.explainer = Explainer(cfg)
         self.explainer.done.connect(self.on_explained)
+        self.explain_step = ""
+        self.explainer.progress.connect(self.on_explain_progress)
+        self.bus = StatusBus()
+        self.bus.busy.connect(self.on_busy)
+        self.bus.step.connect(self.on_explain_progress)
+        self.bus.done.connect(self.on_busy_done)
 
         self.anim = QTimer(self)
         self.anim.timeout.connect(self.tick)
@@ -1147,20 +2083,37 @@ class Pet(QWidget):
         if left <= 0:
             self.feishu_pending = []   # 今天的名额用完了，其余只在桌面看
             return
-        items, self.feishu_pending = self.feishu_pending[:left], []
+        pending, self.feishu_pending = self.feishu_pending, []
         self.feishu_busy = True
 
         def run():
-            if send_feishu(items, title="🤖 今日 AI 新闻"):
-                add_feishu_sent(len(items))
-            else:
-                self.feishu_pending = items + self.feishu_pending  # 失败了下次再试
+            # 按 DeepSeek 的排序，挑前几条「飞书里能打开」的推
+            items = []
+            for n in pending:
+                if len(items) >= left:
+                    break
+                ok, why = link_ok_for_feishu(self.cfg, n.get("link", ""))
+                if ok:
+                    items.append(n)
+                else:
+                    log("飞书跳过：{}（{}）".format(n.get("title", ""), why))
+            if items:
+                self.bus.busy.emit("自动推送今日新闻到飞书")
+                self.bus.step.emit("写深入浅出")
+                explains = explains_for_feishu(self.cfg, items, progress=self.bus.step.emit)
+                self.bus.step.emit("发送到飞书")
+                if send_feishu(items, title="🤖 今日 AI 新闻", explains=explains):
+                    add_feishu_sent(len(items))
+                    self.bus.done.emit(True, "已自动推送到飞书：" + items[0].get("title", ""))
+                else:
+                    self.feishu_pending = items + self.feishu_pending  # 失败了下次再试
+                    self.bus.done.emit(False, "自动推送飞书失败，稍后重试")
             self.feishu_busy = False
         threading.Thread(target=run, daemon=True).start()
 
     def think(self):
         cleanup(self.cfg)          # 每周一才会真正执行
-        self.history = only_today(self.history)
+        self.history = only_recent(self.history, self.history_days())
         self.queue = only_today(self.queue)
         self.feishu_pending = only_today(self.feishu_pending)
         self.flush_feishu()
@@ -1182,12 +2135,15 @@ class Pet(QWidget):
         self.fetching = True
         self.manual = manual
         self.flash_until = 0
+        self.fish_since = time.time()           # 动画：从黑洞里掏报纸
         log("开始抓新闻")
         self.worker.start()
 
     def on_done(self, news, msg):
         self.fetching = False
         self.last_fetch = time.time()
+        # 动画：把报纸摔飞
+        self.fish_end = time.time()
         if news:
             self.queue.extend(news)
             self.feishu_pending.extend(news)
@@ -1195,17 +2151,18 @@ class Pet(QWidget):
             if user_idle_seconds() < 60 and not self.is_quiet():
                 self.push_queue()
         elif msg:
-            # 不弹卡片，用头顶的灯表示结果：蓝色=没有新新闻，紫色=出问题了
+            # 不弹卡片：出问题亮紫灯；没有新新闻就直接回到绿灯
             bad = ("出错" in msg) or ("没抓到" in msg)
-            self.flash_color = QColor("#a78bfa") if bad else QColor("#5aa9ff")
-            self.flash_until = time.time() + 8
+            if bad:
+                self.flash_color = QColor("#a78bfa")
+                self.flash_until = time.time() + 8
             self.last_msg = msg
         self.manual = False
         self.update_tip()
 
     def push_queue(self):
         items, self.queue = self.queue, []
-        self.history = only_today(items + self.history)[:50]
+        self.history = only_recent(items + self.history, self.history_days())[:150]
         save_json(HISTORY_FILE, self.history)
         self.bubble.show_items(items, "新的 AI 新闻")
         self.update_tip()
@@ -1216,7 +2173,7 @@ class Pet(QWidget):
         else:
             tip = "点我看今天的新闻，右键有更多选项"
             if getattr(self, "explaining", None):
-                tip = "正在深入浅出：{}\n{}".format(self.explaining, tip)
+                tip = "正在深入浅出：{}\n当前：{}\n{}".format(self.explaining, getattr(self, "explain_step", ""), tip)
             if self.last_msg:
                 tip = "上次抓取：{}\n{}".format(self.last_msg, tip)
             self.setToolTip(tip)
@@ -1247,18 +2204,28 @@ class Pet(QWidget):
             self.bubble.hide()
         elif self.queue:
             self.push_queue()
-        elif self.history:
-            self.bubble.show_items(self.history[:30], "今天的新闻")
+        elif on_day(self.history, 0):
+            self.bubble.show_items(on_day(self.history, 0)[:30], "今天的新闻")
         else:
-            self.bubble.show_message("今天还没有新闻～右键选「立刻抓一次」试试")
+            self.bubble.show_message("今天还没有新闻～右键选「立刻抓一次」，或者「看新闻」翻翻前几天的")
+
+    def history_days(self):
+        return max(1, min(int(self.cfg.get("history_days", 3)), 7))
+
+    def show_day(self, days_ago):
+        items = on_day(self.history, days_ago)
+        name = ["今天", "昨天", "前天"][days_ago] if days_ago < 3 else "{}天前".format(days_ago)
+        if items:
+            self.bubble.show_items(items[:30], "{}的新闻（{}）".format(name, day_str(days_ago)[5:]))
+        else:
+            self.bubble.show_message("{}没有推过新闻".format(name))
 
     def contextMenuEvent(self, e):
         m = QMenu(self)
         a1 = QAction("立刻抓一次新闻", self)
         a1.triggered.connect(lambda: self.fetch_now(manual=True))
-        a2 = QAction("看今天的新闻", self)
-        a2.triggered.connect(lambda: self.bubble.show_items(self.history[:30], "今天的新闻")
-                             if self.history else self.bubble.show_message("今天还没有新闻"))
+        a2 = QAction("看今天的新闻（{} 条）".format(len(on_day(self.history, 0))), self)
+        a2.triggered.connect(lambda: self.show_day(0))
         if time.time() < self.quiet_until:
             a3 = QAction("取消免打扰", self)
             a3.triggered.connect(self.cancel_quiet)
@@ -1275,14 +2242,23 @@ class Pet(QWidget):
         at.triggered.connect(self.test_feishu)
         ae = QAction("打开「深入浅出」文件夹", self)
         ae.triggered.connect(lambda: (EXPLAIN_DIR.mkdir(exist_ok=True), subprocess.Popen(["open", str(EXPLAIN_DIR)])))
+        asrc = QAction("管理信息源（{} 个）".format(len(self.cfg.get("sources", []))), self)
+        asrc.triggered.connect(self.manage_sources)
         a5 = QAction("打开配置文件夹", self)
         a5.triggered.connect(lambda: subprocess.Popen(["open", str(APP_DIR)]))
         ar = QAction("重启火柴人", self)
         ar.triggered.connect(self.restart)
         a6 = QAction("退出", self)
         a6.triggered.connect(QApplication.quit)
-        for a in (a1, a2, a3, au, a4, af, at, ae, a5):
+        for a in (a1, a2, a3, au, asrc, a4, af, at, ae, a5):
             m.addAction(a)
+        older = QMenu("看前几天的新闻", m)
+        for d in range(1, self.history_days()):
+            name = ["今天", "昨天", "前天"][d] if d < 3 else "{}天前".format(d)
+            act = QAction("{}（{}，{} 条）".format(name, day_str(d)[5:], len(on_day(self.history, d))), self)
+            act.triggered.connect(lambda _=False, dd=d: self.show_day(dd))
+            older.addAction(act)
+        m.insertMenu(a3, older)
         m.addSeparator()
         # 呼吸灯说明（子菜单，鼠标移上去就能看到）
         pm = m.addMenu("我的偏好")
@@ -1298,8 +2274,8 @@ class Pet(QWidget):
         pm.addAction(pc)
         lights = m.addMenu("呼吸灯")
         for color, text in (("#4cd17a", "绿灯：待命"),
-                            ("#ffbe28", "黄灯闪烁：正在抓新闻 / 正在写深入浅出"),
-                            ("#5aa9ff", "蓝灯呼吸：抓完了，没有新新闻"),
+                            ("#ffbe28", "黄灯闪烁：正在抓新闻 / 写深入浅出 / 推送飞书"),
+                            ("#4cd17a", "绿灯呼吸：推送飞书成功"),
                             ("#a78bfa", "紫灯呼吸：抓的时候出了问题（鼠标停在小人上看原因）"),
                             ("#ff5a5f", "红灯 + 数字：有新闻没看")):
             lights.addAction(QAction(dot_icon(color), text, self))
@@ -1307,6 +2283,16 @@ class Pet(QWidget):
         m.addAction(ar)
         m.addAction(a6)
         m.exec(e.globalPos())
+
+    def manage_sources(self):
+        w = getattr(self, "sources_win", None)
+        if w is None or not w.isVisible():
+            self.sources_win = w = SourcesWindow(self)
+        else:
+            w.refresh()
+        w.show()
+        w.raise_()
+        w.activateWindow()
 
     def show_prefs(self):
         prefs = load_prefs()
@@ -1347,6 +2333,24 @@ class Pet(QWidget):
         self.update_tip()
         self.explainer.start(item)
 
+    def on_busy(self, label):
+        self.explaining = label
+        self.explain_step = ""
+        self.flash_until = 0
+        self.update_tip()
+
+    def on_busy_done(self, ok, msg):
+        self.explaining = None
+        self.explain_step = ""
+        self.flash_color = QColor("#4cd17a") if ok else QColor("#a78bfa")   # 成功：绿灯呼吸；失败：紫灯
+        self.flash_until = time.time() + 8
+        self.last_msg = msg
+        self.update_tip()
+
+    def on_explain_progress(self, step):
+        self.explain_step = step
+        self.update_tip()
+
     def on_explained(self, item, text, err):
         self.explaining = None
         self.update_tip()
@@ -1356,8 +2360,15 @@ class Pet(QWidget):
             self.last_msg = "深入浅出失败：" + err
             self.update_tip()
             return
+        alive = []
+        for r in self.readers:                 # 关掉的窗口已经被销毁了，跳过它们
+            try:
+                if r.isVisible():
+                    alive.append(r)
+            except RuntimeError:
+                pass
         w = ReaderWindow(item, text)
-        self.readers = [r for r in self.readers if r.isVisible()] + [w]
+        self.readers = alive + [w]
         w.show()
         w.raise_()
         w.activateWindow()
@@ -1465,6 +2476,12 @@ class Pet(QWidget):
 
     # ---------- 画画 ----------
     def tick(self):
+        busy = bool(self.explaining) and not self.fetching
+        if busy and not getattr(self, "_was_teach", False):
+            self.teach_since = time.time()            # 开始：掏黑板
+        elif not busy and getattr(self, "_was_teach", False):
+            self.teach_end = time.time()              # 结束：收黑板
+        self._was_teach = busy
         self.phase += 0.06
         if self.blink > 0:
             self.blink -= 1
@@ -1472,101 +2489,476 @@ class Pet(QWidget):
             self.blink = 5
         self.update()
 
+    CATCH_LEN = 1.2      # 抓完后摔报纸的动画时长（秒）
+
+    def draw_fetch(self, p, t, ground, mode, ink):
+        """抓新闻：小黑洞 → 手伸进去掏出一份报纸 → 拿着看 → 抓完了把报纸摔飞 → 回到平时。返回头的位置。"""
+        W = self.W
+        now = time.time()
+        pen = QPen(ink, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+
+        def limb(origin, length, angle_deg):
+            a = math.radians(angle_deg)
+            return QPointF(origin.x() + length * math.sin(a), origin.y() + length * math.cos(a))
+
+        def ease(x):
+            x = max(0.0, min(1.0, x))
+            return 1 - (1 - x) ** 2
+
+        def lerp(a, b, f):
+            return QPointF(a.x() + (b.x() - a.x()) * f, a.y() + (b.y() - a.y()) * f)
+
+        # ---- 阶段 ----
+        if mode == "fish":
+            el = now - getattr(self, "fish_since", now)
+            if el < 0.3:
+                stage, k = "open", el / 0.3
+            elif el < 0.6:
+                stage, k = "reach", (el - 0.3) / 0.3
+            elif el < 0.95:
+                stage, k = "pull", (el - 0.6) / 0.35
+            else:
+                stage, k = "read", 1.0
+            w = ease(el / 0.3)
+        else:
+            c = min(1.0, (now - self.fish_end) / self.CATCH_LEN)
+            stage, k = "slam", c
+            w = 1 - ease((c - 0.45) / 0.5) if c > 0.45 else 1.0
+
+        # ---- 就是桌面上那个小人：同一个位置、同样的起伏和站姿 ----
+        cx = W / 2
+        bob = math.sin(t) * 1.5
+        hip = QPointF(cx, ground - 34 + bob)
+        neck = QPointF(cx, hip.y() - 30)
+        head_c = QPointF(cx, neck.y() - 14)
+        shoulder = QPointF(cx, neck.y() + 5)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 35))
+        sw_ = 34 + bob
+        p.drawEllipse(QRectF(cx - sw_ / 2, ground - 3, sw_, 7))
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        swing = 12 + math.sin(t) * 2
+        for sgn in (1, -1):
+            knee = limb(hip, 17, swing * sgn)
+            p.drawLine(hip, knee)
+            p.drawLine(knee, limb(knee, 17, swing * sgn))
+        p.drawLine(neck, hip)
+        sway = math.sin(t) * 6
+        idle_arms = []
+        for up_, lo_ in ((25 + sway, 15 + sway), (-25 - sway, -15 - sway)):
+            e_ = limb(shoulder, 14, up_)
+            idle_arms.append((shoulder, e_, limb(e_, 14, lo_)))
+
+        # ---- 小黑洞（右边，手的高度） ----
+        hole = QRectF(shoulder.x() + 23, shoulder.y() - 9, 15, 24)
+        hole_open = mode == "fish" and not (stage == "read")
+        if mode == "fish":
+            el = now - getattr(self, "fish_since", now)
+            h_ripple, h_frame, h_fade = min(1.0, el / 0.2), ease((el - 0.05) / 0.25), 1 - ease((el - 0.78) / 0.17)
+
+        def outside(r):
+            pth = QPainterPath()
+            pth.setFillRule(Qt.FillRule.OddEvenFill)
+            pth.addRect(QRectF(-50, -50, W + 100, self.H + 100))
+            pth.addEllipse(r)
+            return pth
+
+        # ---- 右手 ----
+        a0 = idle_arms[0][2]
+        reach = QPointF(hole.center().x() + 3, hole.center().y())
+        read = QPointF(shoulder.x() + 11, shoulder.y() + 8 + math.sin(t * 1.3) * 0.8)   # 拿着报纸在身前看
+        paper_off = QPointF(-9, -3)                                   # 报纸中心相对手的位置
+        released, paper = False, None
+        if stage == "open":
+            hand = a0
+        elif stage == "reach":
+            hand = lerp(a0, reach, ease(k))
+        elif stage == "pull":
+            hand = lerp(reach, read, ease(k))
+        elif stage == "read":
+            hand = read
+        else:   # slam：往右上一抬 → 往左狠狠一甩，报纸飞出去
+            wind = QPointF(read.x() + 7, read.y() - 2)
+            throw_end = QPointF(shoulder.x() - 15, shoulder.y() + 3)
+            if k < 0.18:
+                hand = lerp(read, wind, ease(k / 0.18))
+            else:
+                hand = lerp(wind, throw_end, ease((k - 0.18) / 0.14))
+            released = k >= 0.27
+
+        # ---- 两只手臂：动作姿势和平时的姿势按 w 混合 ----
+        mid = lerp(shoulder, hand, 0.5)
+        elbow = QPointF(mid.x() + 3, mid.y() + 6)
+        arms = [(shoulder, elbow, hand), idle_arms[1]]
+        in_hole = stage in ("reach", "pull") and hole_open
+        for i, (s_, e_, h_) in enumerate(arms):
+            s0, e0, h0 = idle_arms[i]
+            a_, b_, c_ = lerp(s0, s_, w), lerp(e0, e_, w), lerp(h0, h_, w)
+            p.save()
+            if i == 0 and in_hole:
+                p.setClipPath(outside(hole))                          # 伸进黑洞的部分看不见
+            p.drawLine(a_, b_)
+            p.drawLine(b_, c_)
+            p.restore()
+            if i == 0:
+                hand = c_
+
+        # ---- 报纸 ----
+        if stage in ("pull", "read") or (stage == "slam" and not released):
+            paper, rot, sc = QPointF(hand.x() + paper_off.x(), hand.y() + paper_off.y()), 0.0, 1.0
+            if stage == "pull":
+                sc = 0.6 + 0.4 * ease(k)
+        elif stage == "slam":
+            f = (k - 0.27) / 0.4                                    # 摔出去之后飞走
+            start = QPointF(shoulder.x() - 15 + paper_off.x(), shoulder.y() + 3 + paper_off.y())
+            paper = QPointF(start.x() - 150 * f, start.y() - 18 * math.sin(min(1.0, f) * math.pi) + 10 * f)
+            rot, sc = -600 * f, 1.0
+            if f > 1:
+                paper = None
+        if paper is not None:
+            p.save()
+            if stage == "pull" and hole_open:
+                p.setClipPath(outside(hole))                          # 从黑洞里被拽出来
+            p.translate(paper)
+            p.rotate(rot + (math.sin(t * 1.7) * 2 if stage == "read" else 0))
+            p.scale(1.55 * sc, 1.55 * sc)
+            p.setPen(QPen(QColor("#9ca3af"), 0.7))
+            p.setBrush(QColor("#fafaf7"))
+            p.drawRect(QRectF(-7, -5, 14, 10))
+            p.setPen(QPen(QColor("#6b7280"), 0.8))
+            p.drawLine(QPointF(-5, -2.6), QPointF(1, -2.6))
+            for yy in (0, 2.4):
+                p.drawLine(QPointF(-5, yy), QPointF(5, yy))
+            p.restore()
+
+        # ---- 黑洞画在手和报纸上面，盖住被吞掉的边缘 ----
+        if hole_open and h_fade > 0:
+            self.draw_door(p, hole, ink, ripple=h_ripple, frame=h_frame, fade=h_fade, wobble=stage == "reach")
+
+        # ---- 头和脸：看黑洞 / 看报纸 ----
+        p.setPen(pen)
+        p.setBrush(QColor("white"))
+        p.drawEllipse(head_c, 12, 12)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(ink)
+        if stage in ("open", "reach", "pull"):
+            look, lookdown = 2.5 * w, 0.0
+        elif stage == "read":
+            look, lookdown = 1.0, 1.5
+        else:
+            look, lookdown = -2.0 * w * (1 if k < 0.6 else 0), 0.0
+        for ex in (head_c.x() - 4.5 + look, head_c.x() + 4.5 + look):
+            if self.blink:
+                p.drawRect(QRectF(ex - 2.5, head_c.y() - 1.5 + lookdown, 5, 1.6))
+            else:
+                p.drawEllipse(QPointF(ex, head_c.y() - 1.5 + lookdown), 1.8, 2.4)
+        p.setPen(QPen(ink, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(QRectF(head_c.x() - 4 + look, head_c.y() + 1 + lookdown * 0.5, 8, 6), 200 * 16, 140 * 16)
+        return head_c
+
+    def draw_door(self, p, r, ink, ripple, frame, fade, wobble=False):
+        """虚空黑洞：空气先泛起透明波纹，然后撕开一个等人高的大黑洞，里面缓缓打旋；用完收拢消失。"""
+        if fade <= 0:
+            return
+        from PyQt6.QtGui import QRadialGradient
+        p.save()
+        c = r.center()
+        now = time.time()
+        # 透明波纹（像空气被搅动）
+        if ripple < 1 or wobble:
+            for j in range(3):
+                ph = ((ripple if not wobble else (now * 2.5) % 1) + j / 3) % 1
+                a = int(110 * (1 - ph) * fade)
+                p.setPen(QPen(QColor(110, 130, 160, a), 1.2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(c, r.width() / 2 * (0.3 + 0.9 * ph), r.height() / 2 * (0.3 + 0.8 * ph))
+        # 黑洞：先竖着撕开一道缝，再张开；结束时收拢成一个点
+        if frame > 0:
+            hh = r.height() / 2 * min(1.0, frame * 1.6) * (0.25 + 0.75 * fade)
+            ww = r.width() / 2 * frame * fade
+            if ww > 0.3 and hh > 0.3:
+                g = QRadialGradient(c, 1.0)
+                g.setCoordinateMode(QRadialGradient.CoordinateMode.ObjectBoundingMode)
+                g.setCenter(0.5, 0.5)
+                g.setFocalPoint(0.5, 0.5)
+                g.setRadius(0.5)
+                g.setColorAt(0.0, QColor(0, 0, 0, 255))
+                g.setColorAt(0.62, QColor(8, 8, 14, 250))
+                g.setColorAt(0.85, QColor(40, 30, 60, 170))
+                g.setColorAt(1.0, QColor(90, 80, 120, 0))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(g)
+                p.drawEllipse(c, ww * 1.15, hh * 1.08)
+                # 里面缓缓打旋的暗纹
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                for j in range(3):
+                    sc = 0.35 + 0.22 * j
+                    p.setPen(QPen(QColor(120, 110, 160, int(70 * fade)), 1))
+                    start = int(((now * (60 + 25 * j)) + j * 120) % 360 * 16)
+                    p.drawArc(QRectF(c.x() - ww * sc, c.y() - hh * sc, 2 * ww * sc, 2 * hh * sc), start, 110 * 16)
+        p.restore()
+
+    def draw_bang(self, p, c, k):
+        """踢中时的黄色爆炸星 + 「砰」。"""
+        p.save()
+        r = 6 + 9 * k
+        pts = []
+        for i in range(16):
+            rr = r if i % 2 == 0 else r * 0.5
+            ang = i * math.pi / 8
+            pts.append(QPointF(c.x() + math.cos(ang) * rr, c.y() + math.sin(ang) * rr))
+        p.setOpacity(max(0.0, 1 - k * 0.8))
+        p.setPen(QPen(QColor("#f59e0b"), 1.5))
+        p.setBrush(QColor("#fde047"))
+        p.drawPolygon(QPolygonF(pts))
+        f = QFont()
+        f.setBold(True)
+        f.setPixelSize(int(7 + 4 * k))
+        p.setFont(f)
+        p.setPen(QColor("#b45309"))
+        p.drawText(QRectF(c.x() - 12, c.y() - 7, 24, 14), Qt.AlignmentFlag.AlignCenter, "砰")
+        p.restore()
+
+    def draw_blackboard(self, p, t, ground, k=1.0, write=True, full=False, fly=0.0):
+        """小黑板：木框 + 墨绿板面 + 支架，粉笔字一笔一笔出现，写满了擦掉重来。
+        k：0→1 表示从虚空里被拉出来的进度（会缩放、移动、淡入）；write：要不要写字；full：直接显示写满的样子。"""
+        board = QRectF(5, ground - 76, 46, 34)
+        p.save()
+        # 左边窗口外就是虚空：黑板整块从那里被拽出来 / 被踹回去，大小不变
+        if k < 1.0:
+            p.translate(-(1 - k) * 62, 0)
+        if fly > 0:
+            f = 1 - (1 - fly) ** 2                       # 被踹：一开始最快
+            p.translate(-f * 62, 0)
+        # 支架
+        p.setPen(QPen(QColor("#8b5a2b"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(QPointF(board.left() + 8, board.bottom()), QPointF(board.left() + 3, ground))
+        p.drawLine(QPointF(board.right() - 8, board.bottom()), QPointF(board.right() - 3, ground))
+        # 木框 + 板面
+        p.setPen(QPen(QColor("#8b5a2b"), 3))
+        p.setBrush(QColor("#2f5d4a"))
+        p.drawRoundedRect(board, 3, 3)
+        # 粉笔字：按时间一笔一笔出现，约 8 秒写满一板
+        strokes = [
+            [(9, 7), (13, 4), (17, 8), (21, 4), (25, 8)],          # 波浪字
+            [(28, 6), (36, 6)],
+            [(9, 14), (19, 14)], [(22, 14), (34, 14)],              # 两行"字"
+            [(9, 20), (15, 20)], [(18, 20), (30, 20)],
+            [(9, 28), (14, 24), (19, 26), (24, 21), (29, 23)],     # 小折线图
+            [(31, 22), (34, 21), (33, 24)],                          # 箭头
+            [(36, 14), (38, 11), (40, 14), (38, 17), (36, 14)],    # 小圈
+        ]
+        cycle = 9.0
+        if full:
+            prog = len(strokes)
+        elif not write:
+            prog = 0
+        else:
+            tt = max(0.0, time.time() - getattr(self, "teach_since", 0) - 1.3) * 1.8   # 掏出黑板后才开始写
+            prog = tt % cycle / (cycle - 1.0) * len(strokes)      # 最后一秒写满停一下
+        p.setPen(QPen(QColor(255, 255, 240, 220), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                      Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i, st in enumerate(strokes):
+            if i >= prog:
+                break
+            frac = min(1.0, prog - i)
+            pts = [QPointF(board.left() + x, board.top() + y) for x, y in st]
+            n = max(1, int((len(pts) - 1) * frac + 0.999))
+            for a, b in zip(pts[:n], pts[1:n + 1]):
+                p.drawLine(a, b)
+        # 粉笔槽
+        p.setPen(QPen(QColor("#8b5a2b"), 2))
+        p.drawLine(QPointF(board.left() + 2, board.bottom() + 2), QPointF(board.right() - 2, board.bottom() + 2))
+        p.restore()
+
     def paintEvent(self, _):
-        """画一个小火柴人。待命：轻轻晃；抓新闻：原地小跑；有新闻：举手挥舞。"""
+        """画一个小火柴人。待命：轻轻晃；抓新闻：原地小跑；有新闻：举手挥舞；深入浅出：在小黑板上写写画画。"""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         ink = QColor("#1f2430")
         t = self.phase
         cx, ground = self.W / 2, self.H - 12
 
-        if self.fetching or self.explaining:
-            mode, speed = "run", 3.2
+        if self.fetching:
+            mode, speed = "fish", 1.0
+        elif self.explaining:
+            el = time.time() - getattr(self, "teach_since", 0)
+            if el < 1.3:                       # 从虚空里掏黑板
+                mode, speed = "pull", 1.0
+                kk = el / 1.3
+                kb = max(0.0, min(1.0, (kk - 0.15) / 0.85))
+                kb = 1 - (1 - kb) ** 3          # 缓出：先快后慢
+                cx = self.W * (0.5 + 0.19 * min(1.0, kk / 0.3))   # 先往右让一步
+            else:
+                mode, speed = "teach", 1.0
+                cx = self.W * 0.69          # 人往右站，左边放小黑板
+        elif time.time() - getattr(self, "teach_end", 0) < 1.1:   # 写完：一脚把黑板踹飞
+            mode, speed = "stow", 1.0
+            a = (time.time() - self.teach_end) / 1.1        # 0→1
+            # 腿：0~0.3 往后蓄力，0.3~0.42 猛踢，0.42~0.6 停住，之后收回
+            if a < 0.3:
+                kick = 11 + 30 * (a / 0.3)
+            elif a < 0.42:
+                kick = 41 - 128 * ((a - 0.3) / 0.12)
+            elif a < 0.6:
+                kick = -87
+            else:
+                kick = -87 + 76 * ((a - 0.6) / 0.4)
+            fly = min(1.0, max(0.0, (a - 0.38) / 0.35))     # 黑板被踢中后飞进虚空的进度
+            back = max(0.0, (a - 0.6) / 0.4)
+            cx = self.W * (0.69 - 0.19 * back)
+        elif time.time() - getattr(self, "fish_end", 0) < self.CATCH_LEN:   # 抓完：把报纸摔飞
+            mode, speed = "catch", 1.0
         elif self.queue:
             mode, speed = "wave", 2.2
         else:
             mode, speed = "idle", 1.0
 
-        # 身体上下起伏
-        if mode == "run":
-            bob = -abs(math.sin(t * speed)) * 5
-        elif mode == "wave":
-            bob = -abs(math.sin(t * 1.6)) * 7   # 小跳
+        if mode in ("fish", "catch"):
+            head_c = self.draw_fetch(p, t, ground, mode, ink)
         else:
-            bob = math.sin(t) * 1.5
-
-        hip = QPointF(cx, ground - 34 + bob)
-        neck = QPointF(cx, hip.y() - 30)
-        head_c = QPointF(cx, neck.y() - 14)
-
-        # 影子（跳起来时变小）
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(0, 0, 0, 35))
-        sw = 34 + bob
-        p.drawEllipse(QRectF(cx - sw / 2, ground - 3, sw, 7))
-
-        pen = QPen(ink, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-
-        def limb(origin, length, angle_deg):
-            a = math.radians(angle_deg)
-            return QPointF(origin.x() + length * math.sin(a), origin.y() + length * math.cos(a))
-
-        # 腿
-        if mode == "run":
-            swing = math.sin(t * speed) * 35
-        elif mode == "wave":
-            swing = 8
-        else:
-            swing = 12 + math.sin(t) * 2
-        for sgn in (1, -1):
-            ang = swing * sgn
-            knee = limb(hip, 17, ang)
-            foot = limb(knee, 17, ang - (abs(ang) * 0.6 if mode == "run" else 0))
-            p.drawLine(hip, knee)
-            p.drawLine(knee, foot)
-
-        # 身体
-        p.drawLine(neck, hip)
-
-        # 手臂
-        shoulder = QPointF(cx, neck.y() + 5)
-        if mode == "run":
-            a1 = math.sin(t * speed) * 50          # 两只手前后反着摆
-            a2 = -a1
-            arms = [(a1, a1 + 70), (a2, a2 + 70)]
-        elif mode == "wave":
-            wave = math.sin(t * 6) * 25
-            arms = [(112 + wave * 0.2, 165 + wave), (-20, -10)]   # 右手高举挥动，左手放下
-        else:
-            sway = math.sin(t) * 6
-            arms = [(25 + sway, 15 + sway), (-25 - sway, -15 - sway)]
-        for upper, lower in arms:
-            elbow = limb(shoulder, 14, upper)
-            hand = limb(elbow, 14, lower)
-            p.drawLine(shoulder, elbow)
-            p.drawLine(elbow, hand)
-
-        # 头
-        p.setBrush(QColor("white"))
-        p.drawEllipse(head_c, 12, 12)
-        # 眼睛（会眨）
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(ink)
-        for ex in (head_c.x() - 4.5, head_c.x() + 4.5):
-            if self.blink:
-                p.drawRect(QRectF(ex - 2.5, head_c.y() - 1.5, 5, 1.6))
+            # 身体上下起伏
+            if mode == "run":
+                bob = -abs(math.sin(t * speed)) * 5
+            elif mode == "wave":
+                bob = -abs(math.sin(t * 1.6)) * 7   # 小跳
             else:
-                p.drawEllipse(QPointF(ex, head_c.y() - 1.5), 1.8, 2.4)
-        # 嘴
-        p.setPen(QPen(ink, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        if mode == "wave":
+                bob = math.sin(t) * 1.5             # 讲解时也和平时一样轻轻起伏，不会像换了个人
+
+            if mode == "teach":
+                self.draw_blackboard(p, t, ground)
+            elif mode == "pull":
+                if kb > 0:
+                    self.draw_blackboard(p, t, ground, k=kb, write=False)
+            elif mode == "stow":
+                if fly < 1.0:
+                    self.draw_blackboard(p, t, ground, full=True, fly=fly)
+                if 0.38 <= a < 0.55:                               # 踢中的一瞬间：砰！
+                    self.draw_bang(p, QPointF(46, ground - 30), (a - 0.38) / 0.17)
+
+            hip = QPointF(cx, ground - 34 + bob)
+            neck = QPointF(cx, hip.y() - 30)
+            head_c = QPointF(cx, neck.y() - 14)
+
+            # 影子（跳起来时变小）
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 35))
+            sw = 34 + bob
+            p.drawEllipse(QRectF(cx - sw / 2, ground - 3, sw, 7))
+
+            pen = QPen(ink, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+
+            def limb(origin, length, angle_deg):
+                a = math.radians(angle_deg)
+                return QPointF(origin.x() + length * math.sin(a), origin.y() + length * math.cos(a))
+
+            # 腿
+            if mode == "run":
+                swing = math.sin(t * speed) * 35
+            elif mode == "wave":
+                swing = 8
+            else:
+                swing = 12 + math.sin(t) * 2
+            for sgn in (1, -1):
+                ang = swing * sgn
+                if mode == "stow" and sgn == -1:
+                    ang = kick + (-swing + 11) * back           # 踢腿的那条腿，收回时回到平时站姿
+                knee = limb(hip, 17, ang)
+                foot = limb(knee, 17, ang - (abs(ang) * 0.6 if mode == "run" else 0))
+                p.drawLine(hip, knee)
+                p.drawLine(knee, foot)
+
+            # 身体
+            p.drawLine(neck, hip)
+
+            # 手臂
+            shoulder = QPointF(cx, neck.y() + 5)
+            if mode == "run":
+                a1 = math.sin(t * speed) * 50          # 两只手前后反着摆
+                a2 = -a1
+                arms = [(a1, a1 + 70), (a2, a2 + 70)]
+            elif mode == "wave":
+                wave = math.sin(t * 6) * 25
+                arms = [(112 + wave * 0.2, 165 + wave), (-20, -10)]   # 右手高举挥动，左手放下
+            elif mode == "pull":
+                # 左手伸向旁边的虚空，把黑板拽出来
+                arms = [(-100 + 15 * (1 - kb), -95 + 10 * math.sin(t * 8) * (1 - kb)), (35, -40)]
+            elif mode == "stow":
+                # 踢腿时两手张开保持平衡，收腿后慢慢放下
+                spread = 1 - back
+                arms = [(-25 - 70 * spread, -15 - 90 * spread), (25 + 80 * spread, 15 + 100 * spread)]
+            elif mode == "teach":
+                # 左手拿粉笔在黑板上写：小幅来回 + 上下移动；右手叉腰
+                wx = math.sin(t * 7) * 9 + math.sin(t * 1.3) * 6
+                wy = math.sin(t * 4.3) * 10
+                arms = [(-112 + wy, -75 + wx), (35, -40)]
+            else:
+                arms = None
+            sway = math.sin(t) * 6
+            idle_r, idle_l = (25 + sway, 15 + sway), (-25 - sway, -15 - sway)
+            if arms is None:
+                arms = [idle_r, idle_l]
+            else:
+                # wb：动作的力度。掏黑板开始时从平时垂手的姿势慢慢抬起来；踹完收腿时慢慢放回平时的样子
+                if mode == "pull":
+                    wb = min(1.0, kk / 0.25)
+                    wb = 1 - (1 - wb) ** 2
+                elif mode == "stow":
+                    wb = 1 - back
+                    if a < 0.12:                       # 刚从写字切到踢：手先从写字的姿势张开
+                        wx = math.sin(t * 7) * 9 + math.sin(t * 1.3) * 6
+                        wy = math.sin(t * 4.3) * 10
+                        f0 = a / 0.12
+                        tw = [(-112 + wy, -75 + wx), (35, -40)]
+                        arms = [(tw[i][0] + (arms[i][0] - tw[i][0]) * f0, tw[i][1] + (arms[i][1] - tw[i][1]) * f0)
+                                for i in range(2)]
+                else:
+                    wb = 1.0
+                mixed = []
+                for upper, lower in arms:
+                    bu, bl = idle_r if upper >= 0 else idle_l
+                    mixed.append((bu + (upper - bu) * wb, bl + (lower - bl) * wb))
+                arms = mixed
+            for k, (upper, lower) in enumerate(arms):
+                elbow = limb(shoulder, 14, upper)
+                hand = limb(elbow, 14, lower)
+                p.drawLine(shoulder, elbow)
+                p.drawLine(elbow, hand)
+                if mode == "teach" and k == 0:
+                    # 手里的小粉笔
+                    p.setPen(QPen(QColor("#fff7d6"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                    p.drawLine(hand, QPointF(hand.x() - 4, hand.y() - 2))
+                    p.setPen(pen)
+
+            # 头
+            p.setBrush(QColor("white"))
+            p.drawEllipse(head_c, 12, 12)
+            # 眼睛（会眨）
+            p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(ink)
-            p.drawEllipse(QPointF(head_c.x(), head_c.y() + 5), 2.2, 2.6)
-        else:
-            p.drawArc(QRectF(head_c.x() - 4, head_c.y() + 1, 8, 6), 200 * 16, 140 * 16)
+            look = -2.5 if mode in ("teach", "pull", "stow") else 0      # 看向黑板
+            if mode == "pull":
+                look *= min(1.0, kk / 0.25)
+            elif mode == "stow":
+                look *= 1 - back
+            for ex in (head_c.x() - 4.5 + look, head_c.x() + 4.5 + look):
+                if self.blink:
+                    p.drawRect(QRectF(ex - 2.5, head_c.y() - 1.5, 5, 1.6))
+                else:
+                    p.drawEllipse(QPointF(ex, head_c.y() - 1.5), 1.8, 2.4)
+            # 嘴
+            p.setPen(QPen(ink, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            if mode == "wave" or (mode == "pull" and kk > 0.15) or (mode == "stow" and 0.3 <= a < 0.7):
+                p.setBrush(ink)
+                p.drawEllipse(QPointF(head_c.x() + (look if mode == "pull" else 0), head_c.y() + 5), 2.2, 2.6)
+            else:
+                p.drawArc(QRectF(head_c.x() - 4, head_c.y() + 1, 8, 6), 200 * 16, 140 * 16)
 
         # 头顶的状态小灯
         p.setPen(Qt.PenStyle.NoPen)
