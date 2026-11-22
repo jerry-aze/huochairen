@@ -1,0 +1,60 @@
+name: 每日飞书推送
+
+on:
+  schedule:
+    # 每天 17:07 UTC = 洛杉矶早上 9:07（夏令时期间是 10:07）。GitHub 高峰时可能晚几分钟到半小时
+    - cron: "7 17 * * *"
+  workflow_dispatch:        # 在 Actions 页面可以手动点「Run workflow」立刻跑一次
+
+permissions:
+  contents: read
+  actions: write          # 只用来给这个定时任务「续期」，见最后一步
+
+concurrency:
+  group: daily-feishu
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: America/Los_Angeles          # 「今天」按这个时区算
+      AI_NEWS_PET_DATA: ${{ github.workspace }}/state
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖（云端不需要界面，只装抓新闻和调模型用的）
+        run: pip install feedparser requests beautifulsoup4 openai
+
+      - name: 取回上次的记录（看过哪些新闻、今天推了几条、花了多少钱）
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: news-state-${{ github.run_id }}
+          restore-keys: news-state-
+
+      - name: 抓新闻并推送到飞书
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+        run: python cloud_push.py
+
+      - name: 保存记录给下次用
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: news-state-${{ github.run_id }}
+
+      - name: 续期（GitHub 会暂停 60 天没动静的公开仓库定时任务，这里每次运行都重新启用一下，就不会被停）
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow enable daily-feishu.yml || true
